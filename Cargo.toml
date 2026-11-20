@@ -1,0 +1,28 @@
+[package]
+name = "gitloom"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast native Git GUI that weaves the commit graph, local changes, pull requests, issues and CI into one window."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kimyc3825/gitloom"
+readme = "README.md"
+keywords = ["git", "gui", "github", "egui", "commit-graph"]
+categories = ["development-tools", "gui"]
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = "0.37.0"
+git2 = { version = "0.21.0", default-features = false }
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# Keep debug builds responsive: optimize dependencies (egui, libgit2) even in dev.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
