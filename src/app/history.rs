@@ -1,13 +1,14 @@
 //! History view: the commit graph on top, the selected commit's details below.
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, RichText, ScrollArea, Sense, Ui, pos2, vec2,
+    self, Align2, Color32, FontId, Key, Rect, RichText, ScrollArea, Sense, Ui, pos2, vec2,
 };
 use git2::Oid;
 
 use super::{Action, ForgeState, GitloomApp};
 use crate::git::ops::GitOp;
 use crate::git::repo::{RefKind, RepoSnapshot};
+use crate::search;
 use crate::ui::graph::{self as graph_ui, NodeStyle, ROW_HEIGHT};
 use crate::ui::{self, Chip, diff};
 use crate::util;
@@ -18,6 +19,8 @@ const SHA_W: f32 = 70.0;
 /// Columns for author/date are hidden below this width.
 const WIDE_LAYOUT: f32 = 820.0;
 const MAX_CHIPS: usize = 4;
+/// Marker next to commits that match the search.
+const MATCH_COLOR: Color32 = Color32::from_rgb(255, 179, 0);
 
 impl GitloomApp {
     pub(super) fn history_view(&mut self, ui: &mut Ui) {
@@ -26,7 +29,108 @@ impl GitloomApp {
             .default_size(340.0)
             .min_size(140.0)
             .show(ui, |ui| self.commit_detail(ui));
-        egui::CentralPanel::no_frame().show(ui, |ui| self.graph_list(ui));
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            self.search_bar(ui);
+            self.graph_list(ui);
+        });
+    }
+
+    fn search_bar(&mut self, ui: &mut Ui) {
+        if self.snapshot.as_ref().is_none_or(|s| s.commits.is_empty()) {
+            return;
+        }
+        ui.horizontal(|ui| {
+            let id = egui::Id::unique("commit_search");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .id(id)
+                    .hint_text("Search commits: message, author, SHA  (Ctrl+F)")
+                    .desired_width(330.0),
+            );
+            if std::mem::take(&mut self.focus_search) {
+                response.request_focus();
+            }
+            if response.changed() {
+                self.update_search();
+                self.step_search(0);
+            }
+            // Enter / Shift+Enter walk through the matches; Escape clears.
+            if response.lost_focus() {
+                let (enter, shift, escape) = ui.input(|i| {
+                    (
+                        i.key_pressed(Key::Enter),
+                        i.modifiers.shift,
+                        i.key_pressed(Key::Escape),
+                    )
+                });
+                if enter {
+                    self.step_search(if shift { -1 } else { 1 });
+                    response.request_focus();
+                } else if escape {
+                    self.search_query.clear();
+                    self.update_search();
+                }
+            }
+            if self.search_query.trim().is_empty() {
+                return;
+            }
+            let total = self.search_matches.len();
+            if total == 0 {
+                ui.colored_label(Color32::from_rgb(239, 83, 80), "No matches");
+            } else {
+                ui.weak(format!("{} of {total}", self.search_pos + 1));
+                if ui
+                    .small_button("Prev")
+                    .on_hover_text("Shift+Enter")
+                    .clicked()
+                {
+                    self.step_search(-1);
+                }
+                if ui.small_button("Next").on_hover_text("Enter").clicked() {
+                    self.step_search(1);
+                }
+            }
+            if ui.small_button("Clear").clicked() {
+                self.search_query.clear();
+                self.update_search();
+            }
+            if self.snapshot.as_ref().is_some_and(|s| s.truncated) {
+                ui.weak("(searching the loaded commits only)");
+            }
+        });
+    }
+
+    /// Recompute the matches for the current query and snapshot.
+    pub(super) fn update_search(&mut self) {
+        let commits = self
+            .snapshot
+            .as_ref()
+            .map_or(&[][..], |s| s.commits.as_slice());
+        self.search_matches = search::find(commits, &self.search_query);
+        self.search_mask = vec![false; commits.len()];
+        for &row in &self.search_matches {
+            self.search_mask[row] = true;
+        }
+        self.search_pos = self
+            .search_pos
+            .min(self.search_matches.len().saturating_sub(1));
+    }
+
+    /// Move to the next (`1`), previous (`-1`) or first (`0`) match and select it.
+    fn step_search(&mut self, delta: isize) {
+        let total = self.search_matches.len();
+        if total == 0 {
+            return;
+        }
+        self.search_pos = if delta == 0 {
+            0
+        } else {
+            (self.search_pos as isize + delta).rem_euclid(total as isize) as usize
+        };
+        let row = self.search_matches[self.search_pos];
+        if let Some(id) = self.snapshot.as_ref().map(|s| s.commits[row].id) {
+            self.select_commit(id, true);
+        }
     }
 
     fn graph_list(&mut self, ui: &mut Ui) {
@@ -109,6 +213,8 @@ impl GitloomApp {
 
         let selected = self.selected;
         let pr_for_ref = &self.pr_for_ref;
+        let searching = !self.search_query.trim().is_empty();
+        let search_mask = &self.search_mask;
         let mut actions = Vec::new();
         let output = ui
             .scope(|ui| {
@@ -122,6 +228,14 @@ impl GitloomApp {
                         );
                         let painter = ui.painter_at(rect);
                         let is_selected = selected == Some(commit.id);
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::Role::ListItem,
+                                true,
+                                is_selected,
+                                &commit.summary,
+                            )
+                        });
                         let background = if is_selected {
                             visuals.selection.bg_fill
                         } else if response.hovered() {
@@ -131,6 +245,12 @@ impl GitloomApp {
                         };
                         if is_selected || response.hovered() {
                             painter.rect_filled(rect, 0.0, background);
+                        }
+                        // While searching, rows that don't match fade out.
+                        let is_match = search_mask.get(row).copied().unwrap_or(false);
+                        let mut painter = painter;
+                        if searching && !is_match {
+                            painter.multiply_opacity(0.3);
                         }
 
                         let graph_rect = Rect::from_min_size(rect.min, vec2(graph_w, ROW_HEIGHT));
@@ -147,6 +267,13 @@ impl GitloomApp {
                         );
 
                         let y = rect.center().y;
+                        if searching && is_match {
+                            let marker = Rect::from_min_size(
+                                pos2(graph_rect.right(), rect.top() + 3.0),
+                                vec2(3.0, ROW_HEIGHT - 6.0),
+                            );
+                            painter.rect_filled(marker, 1.0, MATCH_COLOR);
+                        }
                         let text_right = rect.right() - right_w - 8.0;
                         let label_painter = painter.with_clip_rect(Rect::from_x_y_ranges(
                             rect.left()..=text_right,
@@ -309,6 +436,10 @@ impl GitloomApp {
         });
 
         let selected_file = self.detail_file;
+        let is_stash = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.stashes.iter().any(|stash| stash.id == detail.id));
         egui::Panel::left("detail_files")
             .resizable(true)
             .default_size(300.0)
@@ -324,7 +455,9 @@ impl GitloomApp {
                     ui.colored_label(Color32::from_rgb(102, 187, 106), format!("+{adds}"));
                     ui.colored_label(Color32::from_rgb(239, 83, 80), format!("−{dels}"));
                 });
-                if detail.parents.len() > 1 {
+                if is_stash {
+                    ui.weak("Stash: changes against the commit it was made on");
+                } else if detail.parents.len() > 1 {
                     ui.weak("Merge commit: diff against the first parent");
                 }
                 if detail.truncated {
@@ -352,7 +485,9 @@ impl GitloomApp {
             });
 
         diff::panel().show(ui, |ui| match detail.files.get(selected_file) {
-            Some(file) => diff::show(ui, file, ("commit_diff", detail.id, selected_file)),
+            Some(file) => {
+                diff::show(ui, file, ("commit_diff", detail.id, selected_file), None);
+            }
             None => diff::placeholder(ui, false, "No file changes in this commit"),
         });
 

@@ -70,6 +70,17 @@ pub struct CommitInfo {
     pub author_name: String,
     pub time: i64,
     pub parents: Vec<Oid>,
+    /// Lowercased summary, author name and email, for commit search.
+    pub search_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StashInfo {
+    /// Position in the stash list: `stash@{index}`.
+    pub index: usize,
+    pub id: Oid,
+    pub message: String,
+    pub time: i64,
 }
 
 pub struct RepoSnapshot {
@@ -81,6 +92,7 @@ pub struct RepoSnapshot {
     pub refs: Vec<RefInfo>,
     /// Commit -> indices into `refs`.
     pub refs_at: HashMap<Oid, Vec<usize>>,
+    pub stashes: Vec<StashInfo>,
     pub truncated: bool,
     pub load_time: Duration,
 }
@@ -105,7 +117,23 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
+    /// Display text: no line ending, tabs expanded.
     pub text: String,
+    /// Exact bytes from the diff, line ending included; used to build patches.
+    pub raw: Vec<u8>,
+}
+
+/// Position of a hunk in `FileDiff::lines` and its header numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hunk {
+    /// Index of the `@@` header line.
+    pub header: usize,
+    /// One past the last line of the hunk.
+    pub end: usize,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +146,8 @@ pub struct FileDiff {
     pub deletions: usize,
     pub binary: bool,
     pub lines: Vec<DiffLine>,
+    /// Complete hunks only; a hunk cut off by the size limit is left out.
+    pub hunks: Vec<Hunk>,
     pub truncated: bool,
     /// Longest line in characters, for horizontal scrolling.
     pub max_cols: usize,
@@ -133,6 +163,7 @@ impl FileDiff {
             deletions: 0,
             binary: false,
             lines: Vec::new(),
+            hunks: Vec::new(),
             truncated: false,
             max_cols: 0,
         }
@@ -181,7 +212,9 @@ pub fn discover(path: &Path) -> Result<PathBuf> {
 
 pub fn load_snapshot(root: &Path) -> Result<RepoSnapshot> {
     let started = Instant::now();
-    let repo = Repository::open(root).with_context(|| format!("cannot open {}", root.display()))?;
+    let mut repo =
+        Repository::open(root).with_context(|| format!("cannot open {}", root.display()))?;
+    let stashes = read_stashes(&mut repo);
     let head = read_head(&repo);
     let refs = read_refs(&repo, &head);
 
@@ -230,6 +263,7 @@ pub fn load_snapshot(root: &Path) -> Result<RepoSnapshot> {
         row_of,
         refs,
         refs_at,
+        stashes,
         truncated,
         load_time: started.elapsed(),
     })
@@ -244,14 +278,41 @@ fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {
     let id = commit.id();
     let mut short_id = id.to_string();
     short_id.truncate(7);
+    let summary = commit.summary_bytes().map(lossy).unwrap_or_default();
+    let author_name = lossy(author.name_bytes());
+    let search_text = search_text(&summary, &author_name, &lossy(author.email_bytes()));
     CommitInfo {
         id,
         short_id,
-        summary: commit.summary_bytes().map(lossy).unwrap_or_default(),
-        author_name: lossy(author.name_bytes()),
+        summary,
+        author_name,
         time: author.when().seconds(),
         parents: commit.parent_ids().collect(),
+        search_text,
     }
+}
+
+/// Lowercased text that commit search matches against.
+pub fn search_text(summary: &str, author_name: &str, author_email: &str) -> String {
+    format!("{summary}\u{1f}{author_name} <{author_email}>").to_lowercase()
+}
+
+fn read_stashes(repo: &mut Repository) -> Vec<StashInfo> {
+    let mut entries = Vec::new();
+    // A broken stash ref should not take the whole view down.
+    let _ = repo.stash_foreach(|index, message, id| {
+        entries.push((index, message.to_owned(), *id));
+        true
+    });
+    entries
+        .into_iter()
+        .map(|(index, message, id)| StashInfo {
+            index,
+            id,
+            message,
+            time: repo.find_commit(id).map_or(0, |c| c.time().seconds()),
+        })
+        .collect()
 }
 
 fn read_head(repo: &Repository) -> HeadInfo {
@@ -521,11 +582,13 @@ fn collect_files(diff: &git2::Diff<'_>, mut budget: usize) -> Result<(Vec<FileDi
                         break;
                     }
                     budget -= 1;
+                    let header = file.lines.len();
                     file.lines.push(DiffLine {
                         kind: LineKind::Hunk,
                         old_no: None,
                         new_no: None,
                         text: trim_eol(hunk.header()),
+                        raw: hunk.header().to_vec(),
                     });
                     for l in 0..line_count {
                         if budget == 0 {
@@ -540,18 +603,28 @@ fn collect_files(diff: &git2::Diff<'_>, mut budget: usize) -> Result<(Vec<FileDi
                             ' ' => LineKind::Context,
                             _ => LineKind::Meta, // "\ No newline at end of file" markers
                         };
-                        let text = if kind == LineKind::Meta {
-                            "\\ No newline at end of file".to_owned()
+                        let (text, raw) = if kind == LineKind::Meta {
+                            ("\\ No newline at end of file".to_owned(), Vec::new())
                         } else {
-                            trim_eol(line.content())
+                            (trim_eol(line.content()), line.content().to_vec())
                         };
                         file.lines.push(DiffLine {
                             kind,
                             old_no: line.old_lineno(),
                             new_no: line.new_lineno(),
                             text,
+                            raw,
                         });
                     }
+                    // Reached only when the whole hunk fit in the budget.
+                    file.hunks.push(Hunk {
+                        header,
+                        end: file.lines.len(),
+                        old_start: hunk.old_start(),
+                        old_lines: hunk.old_lines(),
+                        new_start: hunk.new_start(),
+                        new_lines: hunk.new_lines(),
+                    });
                 }
             }
         }

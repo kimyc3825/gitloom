@@ -6,6 +6,7 @@ mod fonts;
 mod forge;
 mod git;
 mod jobs;
+mod search;
 mod ui;
 mod util;
 

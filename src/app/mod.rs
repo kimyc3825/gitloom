@@ -1,20 +1,24 @@
 //! Application state, background-result handling and the top-level layout.
 
 mod changes;
+mod dialogs;
 mod forge_panel;
 mod history;
 mod sidebar;
+#[cfg(test)]
+mod ui_tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Ui};
+use eframe::egui::{self, Align, Color32, Key, Layout, Modifiers, RichText, Ui};
 use git2::Oid;
 
 use crate::forge::{ForgeError, ForgeSnapshot, github};
 use crate::git::ops::GitOp;
 use crate::git::repo::{self, CommitDetail, FileDiff, RefKind, RepoSnapshot, WorkingTree};
 use crate::jobs::{JobResult, Jobs};
+use crate::ui::diff::DiffEvent;
 use crate::ui::graph::ROW_HEIGHT;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,8 +42,14 @@ enum ForgeState {
 /// Requests made while drawing. They are applied after the UI code of the
 /// frame, so drawing code only ever needs shared borrows of the state.
 enum Action {
-    SelectCommit { id: Oid, center: bool },
-    SelectChange { path: String, staged: bool },
+    SelectCommit {
+        id: Oid,
+        center: bool,
+    },
+    SelectChange {
+        path: String,
+        staged: bool,
+    },
     Op(GitOp),
     CheckoutPr(u64),
     SelectPr(u64),
@@ -47,6 +57,13 @@ enum Action {
     OpenBranchDialog(Oid),
     Refresh,
     RefreshForge,
+    /// Line selection or hunk/line buttons in the working-tree diff.
+    Diff(DiffEvent),
+    /// Ask before running a destructive operation.
+    Confirm(Confirm),
+    OpenStashDialog,
+    /// Show a stash's changes in the commit detail panel.
+    ShowStash(Oid),
 }
 
 struct Message {
@@ -57,6 +74,28 @@ struct Message {
 struct BranchDialog {
     at: Oid,
     name: String,
+    focus: bool,
+}
+
+/// A destructive operation waiting for the user's OK.
+struct Confirm {
+    title: String,
+    message: String,
+    confirm_label: String,
+    op: GitOp,
+    /// Optional checkbox that swaps in another operation (e.g. force delete).
+    toggle: Option<ConfirmToggle>,
+}
+
+struct ConfirmToggle {
+    label: String,
+    checked: bool,
+    op: GitOp,
+}
+
+struct StashDialog {
+    message: String,
+    include_untracked: bool,
     focus: bool,
 }
 
@@ -85,6 +124,16 @@ pub struct GitloomApp {
     change_diff: Option<FileDiff>,
     commit_message: String,
     amend: bool,
+    /// Lines picked in `change_diff` for partial staging.
+    diff_selection: BTreeSet<usize>,
+    diff_anchor: Option<usize>,
+
+    search_query: String,
+    /// Rows of `snapshot.commits` matching the query, plus a per-row mask.
+    search_matches: Vec<usize>,
+    search_mask: Vec<bool>,
+    search_pos: usize,
+    focus_search: bool,
 
     forge: ForgeState,
     forge_gen: u64,
@@ -98,6 +147,8 @@ pub struct GitloomApp {
     busy_label: Option<String>,
     message: Option<Message>,
     branch_dialog: Option<BranchDialog>,
+    confirm: Option<Confirm>,
+    stash_dialog: Option<StashDialog>,
     actions: Vec<Action>,
     was_focused: bool,
 }
@@ -125,6 +176,13 @@ impl GitloomApp {
             change_diff: None,
             commit_message: String::new(),
             amend: false,
+            diff_selection: BTreeSet::new(),
+            diff_anchor: None,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_mask: Vec::new(),
+            search_pos: 0,
+            focus_search: false,
             forge: ForgeState::Idle,
             forge_gen: 0,
             forge_loading: false,
@@ -135,6 +193,8 @@ impl GitloomApp {
             busy_label: None,
             message: None,
             branch_dialog: None,
+            confirm: None,
+            stash_dialog: None,
             actions: Vec::new(),
             was_focused: true,
         };
@@ -166,6 +226,15 @@ impl GitloomApp {
         self.change_diff = None;
         self.commit_message.clear();
         self.amend = false;
+        self.diff_selection.clear();
+        self.diff_anchor = None;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_mask.clear();
+        self.search_pos = 0;
+        self.branch_dialog = None;
+        self.confirm = None;
+        self.stash_dialog = None;
         self.forge = ForgeState::Idle;
         self.selected_pr = None;
         self.pr_for_ref.clear();
@@ -255,6 +324,10 @@ impl GitloomApp {
         let Some(root) = self.root.clone() else {
             return;
         };
+        if self.selected_change.as_ref() != Some(&(path.clone(), staged)) {
+            self.diff_selection.clear();
+            self.diff_anchor = None;
+        }
         self.selected_change = Some((path.clone(), staged));
         self.jobs.spawn(move || {
             let result = repo::load_file_diff(&root, &path, staged);
@@ -402,7 +475,18 @@ impl GitloomApp {
                         continue;
                     }
                     match result {
-                        Ok(diff) => self.change_diff = Some(diff),
+                        Ok(diff) => {
+                            // Keep the line selection if only a refresh happened.
+                            let unchanged = self
+                                .change_diff
+                                .as_ref()
+                                .is_some_and(|old| same_lines(old, &diff));
+                            if !unchanged {
+                                self.diff_selection.clear();
+                                self.diff_anchor = None;
+                            }
+                            self.change_diff = Some(diff);
+                        }
                         Err(e) => self.set_error(format!("Failed to load diff: {e:#}")),
                     }
                 }
@@ -435,8 +519,7 @@ impl GitloomApp {
                         Err(e) => self.set_error(format!("{} failed: {e:#}", op.label())),
                     }
                     if op.changes_history() {
-                        let remote = matches!(op, GitOp::Fetch | GitOp::Pull | GitOp::Push { .. });
-                        self.refresh(remote);
+                        self.refresh(op.touches_remote());
                     } else {
                         self.refresh_status();
                     }
@@ -457,15 +540,17 @@ impl GitloomApp {
         // If the selection was following HEAD (e.g. right after a commit), keep following it.
         let old_head = self.snapshot.as_ref().and_then(|s| s.head.target);
         let follows_head = self.selected.is_some() && self.selected == old_head;
-        let kept = self
-            .selected
-            .filter(|id| !follows_head && snap.row_of.contains_key(id));
+        let kept = self.selected.filter(|id| {
+            !follows_head
+                && (snap.row_of.contains_key(id) || snap.stashes.iter().any(|s| s.id == *id))
+        });
         let first_load = self.snapshot.is_none();
         let target = kept
             .or(snap.head.target)
             .or_else(|| snap.commits.first().map(|c| c.id));
         self.snapshot = Some(snap);
         self.recompute_pr_links();
+        self.update_search();
         match target {
             Some(id) => self.select_commit(id, first_load && kept.is_none()),
             None => {
@@ -521,6 +606,19 @@ impl GitloomApp {
                 }
                 Action::Refresh => self.refresh(true),
                 Action::RefreshForge => self.refresh_forge(),
+                Action::Diff(event) => self.handle_diff_event(event),
+                Action::Confirm(confirm) => self.confirm = Some(confirm),
+                Action::OpenStashDialog => {
+                    self.stash_dialog = Some(StashDialog {
+                        message: String::new(),
+                        include_untracked: true,
+                        focus: true,
+                    });
+                }
+                Action::ShowStash(id) => {
+                    self.view = View::History;
+                    self.select_commit(id, false);
+                }
             }
         }
     }
@@ -540,6 +638,10 @@ impl GitloomApp {
 
         if ctx.input(|i| i.key_pressed(Key::F5)) {
             self.actions.push(Action::Refresh);
+        }
+        if self.root.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+            self.view = View::History;
+            self.focus_search = true;
         }
         if self.view != View::History || ctx.egui_wants_keyboard_input() {
             return;
@@ -726,48 +828,6 @@ impl GitloomApp {
         });
         ui.separator();
     }
-
-    fn branch_dialog_ui(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &mut self.branch_dialog else {
-            return;
-        };
-        let mut close = false;
-        let mut create = None;
-        let modal = egui::Modal::new(egui::Id::unique("create_branch")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.heading("Create branch");
-            ui.weak(format!("at {}", &dialog.at.to_string()[..7]));
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut dialog.name)
-                    .hint_text("feature/my-change")
-                    .desired_width(f32::INFINITY),
-            );
-            if dialog.focus {
-                edit.request_focus();
-                dialog.focus = false;
-            }
-            let valid = !dialog.name.trim().is_empty();
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ui.horizontal(|ui| {
-                let clicked = ui
-                    .add_enabled(valid, egui::Button::new("Create and switch"))
-                    .clicked();
-                if valid && (clicked || enter) {
-                    create = Some((dialog.name.trim().to_owned(), dialog.at));
-                }
-                close |= ui.button("Cancel").clicked();
-            });
-        });
-        close |= modal.should_close();
-        if let Some((name, at)) = create {
-            self.actions
-                .push(Action::Op(GitOp::CreateBranch { name, at }));
-            close = true;
-        }
-        if close {
-            self.branch_dialog = None;
-        }
-    }
 }
 
 impl eframe::App for GitloomApp {
@@ -805,10 +865,20 @@ impl eframe::App for GitloomApp {
             });
         }
 
-        self.branch_dialog_ui(&ctx);
+        self.dialogs_ui(&ctx);
         if !self.actions.is_empty() {
             self.process_actions();
             ctx.request_repaint();
         }
     }
+}
+
+/// Same lines in the same order: a reload that didn't change the diff.
+fn same_lines(old: &FileDiff, new: &FileDiff) -> bool {
+    old.lines.len() == new.lines.len()
+        && old
+            .lines
+            .iter()
+            .zip(&new.lines)
+            .all(|(a, b)| a.kind == b.kind && a.raw == b.raw)
 }

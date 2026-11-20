@@ -1,11 +1,12 @@
-//! Left sidebar: branches, remote branches and tags.
+//! Left sidebar: branches, remote branches, tags and stashes.
 
 use eframe::egui::{self, Color32, RichText, ScrollArea, Ui};
 
-use super::{Action, ForgeState, GitloomApp};
+use super::{Action, Confirm, ConfirmToggle, ForgeState, GitloomApp};
 use crate::git::ops::GitOp;
-use crate::git::repo::{RefInfo, RefKind};
+use crate::git::repo::{RefInfo, RefKind, StashInfo};
 use crate::ui::{Chip, diff};
+use crate::util;
 
 impl GitloomApp {
     pub(super) fn sidebar(&mut self, ui: &mut Ui) {
@@ -17,6 +18,7 @@ impl GitloomApp {
             ForgeState::Loaded(forge) => forge.pulls.as_slice(),
             _ => &[],
         };
+        let now = util::now_secs();
         let mut actions = Vec::new();
 
         ScrollArea::vertical()
@@ -122,24 +124,51 @@ impl GitloomApp {
                         }
                     });
                 }
+
+                if !snap.stashes.is_empty() {
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("Stashes ({})", snap.stashes.len())).strong(),
+                    )
+                    .id_salt("Stashes")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for stash in &snap.stashes {
+                            let label = format!("stash@{{{}}}  {}", stash.index, stash.message);
+                            let response = ui
+                                .add(
+                                    egui::Button::selectable(
+                                        self.selected == Some(stash.id),
+                                        label,
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "{}\n{} · right-click to apply, pop or drop",
+                                    stash.message,
+                                    util::relative_time(stash.time, now)
+                                ));
+                            if response.clicked() {
+                                actions.push(Action::ShowStash(stash.id));
+                            }
+                            response.context_menu(|ui| stash_menu(ui, stash, &mut actions));
+                        }
+                    });
+                }
             });
         self.actions.extend(actions);
     }
 }
 
 fn ref_menu(ui: &mut Ui, r: &RefInfo, actions: &mut Vec<Action>) {
-    match r.kind {
-        RefKind::LocalBranch
-            if !r.is_head && ui.button(format!("Switch to {}", r.name)).clicked() =>
-        {
-            actions.push(Action::Op(GitOp::Switch(r.name.clone())));
-            ui.close();
-        }
-        RefKind::RemoteBranch if ui.button("Check out as a local branch").clicked() => {
-            actions.push(Action::Op(GitOp::TrackRemote(r.name.clone())));
-            ui.close();
-        }
-        _ => {}
+    let local = r.kind == RefKind::LocalBranch;
+    let remote = r.kind == RefKind::RemoteBranch;
+    if local && !r.is_head && ui.button(format!("Switch to {}", r.name)).clicked() {
+        actions.push(Action::Op(GitOp::Switch(r.name.clone())));
+        ui.close();
+    }
+    if remote && ui.button("Check out as a local branch").clicked() {
+        actions.push(Action::Op(GitOp::TrackRemote(r.name.clone())));
+        ui.close();
     }
     if ui.button("Create branch from here…").clicked() {
         actions.push(Action::OpenBranchDialog(r.target));
@@ -147,6 +176,88 @@ fn ref_menu(ui: &mut Ui, r: &RefInfo, actions: &mut Vec<Action>) {
     }
     if ui.button("Copy name").clicked() {
         ui.ctx().copy_text(r.name.clone());
+        ui.close();
+    }
+
+    if local && !r.is_head {
+        ui.separator();
+        if ui.button("Delete branch…").clicked() {
+            actions.push(Action::Confirm(delete_branch(r)));
+            ui.close();
+        }
+    }
+    if remote {
+        ui.separator();
+        if ui.button("Delete on remote…").clicked() {
+            actions.push(Action::Confirm(delete_remote_branch(r)));
+            ui.close();
+        }
+    }
+}
+
+fn delete_branch(r: &RefInfo) -> Confirm {
+    Confirm {
+        title: "Delete branch?".to_owned(),
+        message: format!(
+            "Delete the local branch {}? Commits that only this branch points to will no longer be shown.",
+            r.name
+        ),
+        confirm_label: "Delete branch".to_owned(),
+        op: GitOp::DeleteBranch {
+            name: r.name.clone(),
+            force: false,
+        },
+        toggle: Some(ConfirmToggle {
+            label: "Delete even if it isn't merged (git branch -D)".to_owned(),
+            checked: false,
+            op: GitOp::DeleteBranch {
+                name: r.name.clone(),
+                force: true,
+            },
+        }),
+    }
+}
+
+fn delete_remote_branch(r: &RefInfo) -> Confirm {
+    let (remote, branch) = r
+        .name
+        .split_once('/')
+        .unwrap_or(("origin", r.name.as_str()));
+    Confirm {
+        title: "Delete remote branch?".to_owned(),
+        message: format!(
+            "Delete {branch} on {remote}? This removes the branch from the remote for everyone."
+        ),
+        confirm_label: "Delete on remote".to_owned(),
+        op: GitOp::DeleteRemoteBranch {
+            remote: remote.to_owned(),
+            branch: branch.to_owned(),
+        },
+        toggle: None,
+    }
+}
+
+fn stash_menu(ui: &mut Ui, stash: &StashInfo, actions: &mut Vec<Action>) {
+    if ui.button("Apply").clicked() {
+        actions.push(Action::Op(GitOp::StashApply(stash.index)));
+        ui.close();
+    }
+    if ui.button("Pop (apply and drop)").clicked() {
+        actions.push(Action::Op(GitOp::StashPop(stash.index)));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Drop…").clicked() {
+        actions.push(Action::Confirm(Confirm {
+            title: "Drop stash?".to_owned(),
+            message: format!(
+                "Delete stash@{{{}}} ({})? This can't be undone.",
+                stash.index, stash.message
+            ),
+            confirm_label: "Drop stash".to_owned(),
+            op: GitOp::StashDrop(stash.index),
+            toggle: None,
+        }));
         ui.close();
     }
 }

@@ -1,11 +1,16 @@
-//! Changes view: unstaged/staged files, the commit box, and the file diff.
+//! Changes view: unstaged/staged files, the commit box, and the file diff
+//! with hunk- and line-level staging.
+
+use std::collections::BTreeSet;
 
 use eframe::egui::{self, Align, Key, Layout, Modifiers, RichText, ScrollArea, Ui};
 
-use super::{Action, GitloomApp};
+use super::{Action, Confirm, GitloomApp};
 use crate::git::ops::GitOp;
+use crate::git::patch::{self, PatchMode};
 use crate::git::repo::StatusFile;
-use crate::ui::{self, diff};
+use crate::ui::diff::{self, DiffEvent, LineOps};
+use crate::ui::{self as widgets};
 
 impl GitloomApp {
     pub(super) fn changes_view(&mut self, ui: &mut Ui) {
@@ -18,8 +23,15 @@ impl GitloomApp {
                 egui::CentralPanel::no_frame().show(ui, |ui| self.change_lists(ui));
             });
 
+        let mut event = None;
         diff::panel().show(ui, |ui| match (&self.selected_change, &self.change_diff) {
-            (Some(_), Some(file)) => diff::show(ui, file, "change_diff"),
+            (Some((_, staged)), Some(file)) => {
+                let ops = LineOps {
+                    selection: &self.diff_selection,
+                    staged: *staged,
+                };
+                event = diff::show(ui, file, "change_diff", Some(ops));
+            }
             (Some(_), None) => diff::placeholder(ui, true, ""),
             (None, _) => {
                 let clean = self.status.as_ref().is_some_and(|s| s.is_clean());
@@ -34,6 +46,9 @@ impl GitloomApp {
                 );
             }
         });
+        if let Some(event) = event {
+            self.actions.push(Action::Diff(event));
+        }
     }
 
     fn change_lists(&mut self, ui: &mut Ui) {
@@ -43,6 +58,16 @@ impl GitloomApp {
         };
         let selected = self.selected_change.as_ref();
         let mut actions = Vec::new();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let stash = ui
+                .add_enabled(!status.is_clean(), egui::Button::new("Stash…"))
+                .on_hover_text("Save the changes for later and clean the working tree");
+            if stash.clicked() {
+                actions.push(Action::OpenStashDialog);
+            }
+        });
+        ui.add_space(4.0);
         ScrollArea::vertical()
             .id_salt("change_lists")
             .auto_shrink(false)
@@ -107,6 +132,100 @@ impl GitloomApp {
         });
         ui.add_space(6.0);
     }
+
+    pub(super) fn handle_diff_event(&mut self, event: DiffEvent) {
+        let Some(path) = self.selected_change.as_ref().map(|(p, _)| p.clone()) else {
+            return;
+        };
+        match event {
+            DiffEvent::ClickLine {
+                index,
+                extend,
+                toggle,
+            } => self.click_diff_line(index, extend, toggle),
+            DiffEvent::ClearSelection => {
+                self.diff_selection.clear();
+                self.diff_anchor = None;
+            }
+            DiffEvent::Hunk { hunk, mode } => {
+                let Some(file) = &self.change_diff else {
+                    return;
+                };
+                let lines = patch::hunk_lines(file, hunk);
+                self.apply_lines(&lines, mode, format!("hunk in {path}"));
+            }
+            DiffEvent::Lines(mode) => {
+                let lines = std::mem::take(&mut self.diff_selection);
+                let n = lines.len();
+                let plural = if n == 1 { "" } else { "s" };
+                self.apply_lines(&lines, mode, format!("{n} line{plural} in {path}"));
+                // Keep the selection until the operation actually ran.
+                self.diff_selection = lines;
+            }
+        }
+    }
+
+    /// Click: select one line. Shift: select a range. Ctrl: add/remove a line.
+    fn click_diff_line(&mut self, index: usize, extend: bool, toggle: bool) {
+        let Some(file) = &self.change_diff else {
+            return;
+        };
+        if let (true, Some(anchor)) = (extend, self.diff_anchor) {
+            if !toggle {
+                self.diff_selection.clear();
+            }
+            self.diff_selection
+                .extend((anchor.min(index)..=anchor.max(index)).filter(|&i| {
+                    file.lines
+                        .get(i)
+                        .is_some_and(|l| patch::is_selectable(l.kind))
+                }));
+            return;
+        }
+        if toggle {
+            if !self.diff_selection.remove(&index) {
+                self.diff_selection.insert(index);
+            }
+        } else if self.diff_selection.len() == 1 && self.diff_selection.contains(&index) {
+            self.diff_selection.clear();
+        } else {
+            self.diff_selection.clear();
+            self.diff_selection.insert(index);
+        }
+        self.diff_anchor = Some(index);
+    }
+
+    fn apply_lines(&mut self, lines: &BTreeSet<usize>, mode: PatchMode, what: String) {
+        let built = match &self.change_diff {
+            Some(file) => patch::build(file, lines, mode),
+            None => return,
+        };
+        let patch = match built {
+            Ok(patch) => patch,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let op = GitOp::ApplyPatch {
+            patch,
+            mode,
+            what: what.clone(),
+        };
+        if mode == PatchMode::Discard {
+            self.confirm = Some(Confirm {
+                title: "Discard changes?".to_owned(),
+                message: format!(
+                    "Throw away the {what} from the working tree? This can't be undone."
+                ),
+                confirm_label: "Discard changes".to_owned(),
+                op,
+                toggle: None,
+            });
+        } else {
+            self.run_op(op);
+        }
+    }
 }
 
 fn section(
@@ -161,7 +280,7 @@ fn section(
             ui.label(
                 RichText::new(file.status.to_string())
                     .monospace()
-                    .color(ui::status_color(file.status)),
+                    .color(widgets::status_color(file.status)),
             );
             let is_selected = selected.is_some_and(|(path, s)| *s == staged && *path == file.path);
             let response = ui
@@ -175,6 +294,67 @@ fn section(
                     staged,
                 });
             }
+            response.context_menu(|ui| file_menu(ui, file, staged, actions));
         });
+    }
+}
+
+fn file_menu(ui: &mut Ui, file: &StatusFile, staged: bool, actions: &mut Vec<Action>) {
+    let paths = || vec![file.path.clone()];
+    if staged {
+        if ui.button("Unstage").clicked() {
+            actions.push(Action::Op(GitOp::Unstage(paths())));
+            ui.close();
+        }
+    } else {
+        if ui.button("Stage").clicked() {
+            actions.push(Action::Op(GitOp::Stage(paths())));
+            ui.close();
+        }
+        let untracked = file.status == '?';
+        let label = if untracked {
+            "Delete file…"
+        } else {
+            "Discard changes…"
+        };
+        if ui.button(label).clicked() {
+            let message = if untracked {
+                format!(
+                    "Delete the untracked file {}? This can't be undone.",
+                    file.path
+                )
+            } else {
+                format!(
+                    "Throw away all unstaged changes in {}? This can't be undone.",
+                    file.path
+                )
+            };
+            actions.push(Action::Confirm(Confirm {
+                title: if untracked {
+                    "Delete file?"
+                } else {
+                    "Discard changes?"
+                }
+                .to_owned(),
+                message,
+                confirm_label: if untracked {
+                    "Delete file"
+                } else {
+                    "Discard changes"
+                }
+                .to_owned(),
+                op: GitOp::DiscardFile {
+                    path: file.path.clone(),
+                    untracked,
+                },
+                toggle: None,
+            }));
+            ui.close();
+        }
+    }
+    ui.separator();
+    if ui.button("Copy path").clicked() {
+        ui.ctx().copy_text(file.path.clone());
+        ui.close();
     }
 }

@@ -2,7 +2,7 @@
 name = "gitloom"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "A fast native Git GUI that weaves the commit graph, local changes, pull requests, issues and CI into one window."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kimyc3825/gitloom"
@@ -26,3 +26,6 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["eframe"] }

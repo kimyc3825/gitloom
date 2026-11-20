@@ -172,6 +172,14 @@ fn pr_list(
                         }
                     });
                 });
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::Role::ListItem,
+                        true,
+                        selected == Some(pr.number),
+                        format!("#{} {}", pr.number, pr.title),
+                    )
+                });
                 if response.double_clicked() {
                     actions.push(Action::ShowPrInGraph(pr.number));
                 } else if response.clicked() {
@@ -278,6 +286,13 @@ fn issue_list(ui: &mut Ui, issues: &[Issue], now: i64) {
                         meta.push_str(&format!(" · assigned to {}", issue.assignees.join(", ")));
                     }
                     ui.add(egui::Label::new(RichText::new(meta).weak()).wrap());
+                });
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::Role::ListItem,
+                        true,
+                        format!("#{} {}", issue.number, issue.title),
+                    )
                 });
                 if response.on_hover_text("Open on GitHub").clicked() {
                     ui.ctx().open_url(OpenUrl::new_tab(&issue.url));
