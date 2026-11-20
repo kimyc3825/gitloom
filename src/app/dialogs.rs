@@ -10,6 +10,7 @@ const DANGER: Color32 = Color32::from_rgb(200, 55, 55);
 impl GitloomApp {
     pub(super) fn dialogs_ui(&mut self, ctx: &egui::Context) {
         self.branch_dialog_ui(ctx);
+        self.rebase_dialog_ui(ctx);
         self.confirm_ui(ctx);
         self.stash_dialog_ui(ctx);
     }

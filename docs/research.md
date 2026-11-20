@@ -195,7 +195,7 @@ VS Code(내장 Git + GitLens + GitHub Pull Requests and Issues), JetBrains IDE, 
 |---|---|---|
 | **그래프 위에 협업 정보를 겹친다** | P1 | 브랜치 라벨 옆에 PR 번호와 CI 상태를 표시. PR을 고르면 그래프에서 해당 브랜치로 이동하고, 바로 체크아웃 |
 | **네이티브 Rust, 단일 실행 파일** | P2, P4 | Rust + egui(즉시 모드 GUI). Windows/macOS/Linux를 같은 코드로 지원, 가상 스크롤로 큰 히스토리도 가볍게 |
-| **읽기는 라이브러리, 쓰기는 진짜 git** | P2, P5 | 히스토리·diff·상태 읽기는 libgit2(`git2`)로 빠르게, 스테이징·커밋·fetch 같은 쓰기는 `git` CLI로 실행해 훅·서명·자격 증명을 터미널과 동일하게 |
+| **읽기는 라이브러리, 쓰기는 진짜 git** | P2, P5 | 히스토리·diff·상태 읽기는 libgit2(`git2`)로 빠르게(blame·파일 히스토리는 더 빠르고 이름 변경을 따라가는 `git` CLI로), 스테이징·커밋·rebase 같은 쓰기는 `git` CLI로 실행해 훅·서명·자격 증명을 터미널과 동일하게 |
 | **기존 인증 재사용, 계정 강제 없음** | P3 | GitHub CLI(`gh`) 로그인을 그대로 사용. 별도 가입 없음, 오픈소스 |
 | **한 화면에 다 보이게** | P6 | 브랜치 사이드바 · 히스토리/변경사항 · PR/이슈 패널을 한 창에 배치 |
 | **키보드 우선** | P7 | ↑/↓ 탐색, F5 새로고침부터 시작해 명령 팔레트까지 확장 |
@@ -213,7 +213,7 @@ VS Code(내장 Git + GitLens + GitHub Pull Requests and Issues), JetBrains IDE, 
 - **그래프 ↔ PR 연결**: 브랜치 라벨에 PR 배지, PR에서 그래프로 이동, `gh pr checkout`
 - 브랜치 생성·전환, fetch/pull/push, 창에 포커스가 돌아오면 상태 자동 갱신
 
-### v0.2 ✅ (현재)
+### v0.2 ✅
 - 헝크/줄 단위 스테이징·언스테이징·되돌리기(패치를 만들어 `git apply`로 적용)
 - 파일 되돌리기·삭제, 되돌릴 수 없는 작업은 확인 창
 - stash: 만들기(메시지, untracked 포함), 목록·내용 보기, apply·pop·drop
@@ -221,12 +221,16 @@ VS Code(내장 Git + GitLens + GitHub Pull Requests and Issues), JetBrains IDE, 
 - 로컬·원격 브랜치 삭제
 - egui_kittest로 실제 UI를 조작하는 UI 테스트
 
-### v0.3
-- 드래그 앤 드롭 인터랙티브 rebase, 3-way 충돌 해결
-- blame, 파일 히스토리
+### v0.3 ✅ (현재)
+- 드래그 앤 드롭 인터랙티브 rebase: 순서 변경(드래그·화살표·단축키), pick/reword/edit/squash/fixup/drop, 이미 push한 커밋 경고, `--autostash`. todo 목록만 바꿔 `git rebase -i`로 실행
+- 3-way 충돌 해결: 충돌마다 ours·base·theirs 비교, 한쪽·양쪽 선택이나 직접 편집, 파일 전체를 한쪽 버전으로, 삭제 충돌 처리
+- 진행 중인 merge·rebase·cherry-pick·revert 배너(계속·건너뛰기·중단)
+- merge·rebase·cherry-pick·revert 메뉴, force push(`--force-with-lease`)
+- blame(줄별 커밋과 작성 시기, 이전 변경 기준 blame), 파일 히스토리(이름 변경 추적, 커밋별 diff)
 
 ### v0.4 이후
 - PR 상세(리뷰 코멘트, 파일별 리뷰), 이슈에서 브랜치 만들기
 - GitLab 등 다른 포지 지원(포지 추상화 계층)
 - 명령 팔레트, reflog 기반 Undo
+- merge 커밋을 포함한 인터랙티브 rebase(`--rebase-merges`), merge 커밋 revert
 - 대형 저장소: commit-graph 파일 활용·점진 로딩, gitoxide 검토

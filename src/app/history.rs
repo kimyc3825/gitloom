@@ -3,8 +3,8 @@
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, Rect, RichText, ScrollArea, Sense, Ui, pos2, vec2,
 };
-use git2::Oid;
 
+use super::file_view::FileMode;
 use super::{Action, ForgeState, GitloomApp};
 use crate::git::ops::GitOp;
 use crate::git::repo::{RefKind, RepoSnapshot};
@@ -213,6 +213,11 @@ impl GitloomApp {
 
         let selected = self.selected;
         let pr_for_ref = &self.pr_for_ref;
+        // Merging, rebasing etc. are offered only while nothing else is in progress.
+        let busy = self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.in_progress.is_some());
         let searching = !self.search_query.trim().is_empty();
         let search_mask = &self.search_mask;
         let mut actions = Vec::new();
@@ -357,7 +362,7 @@ impl GitloomApp {
                                 center: false,
                             });
                         }
-                        response.context_menu(|ui| commit_menu(ui, snap, commit.id, &mut actions));
+                        response.context_menu(|ui| commit_menu(ui, snap, row, busy, &mut actions));
                     }
                 })
             })
@@ -476,9 +481,36 @@ impl GitloomApp {
                                 );
                                 let item = egui::Button::selectable(selected_file == i, &file.path)
                                     .truncate();
-                                if ui.add(item).on_hover_text(&file.path).clicked() {
+                                let response = ui.add(item).on_hover_text(&file.path);
+                                if response.clicked() {
                                     picked_file = Some(i);
                                 }
+                                response.context_menu(|ui| {
+                                    if ui.button("File history").clicked() {
+                                        actions.push(Action::OpenFile {
+                                            path: file.path.clone(),
+                                            mode: FileMode::History,
+                                            rev: None,
+                                        });
+                                        ui.close();
+                                    }
+                                    // A stash isn't a real commit; there's nothing to blame there.
+                                    if file.status != 'D'
+                                        && !is_stash
+                                        && ui.button("Blame at this commit").clicked()
+                                    {
+                                        actions.push(Action::OpenFile {
+                                            path: file.path.clone(),
+                                            mode: FileMode::Blame,
+                                            rev: Some(detail.id),
+                                        });
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy path").clicked() {
+                                        ui.ctx().copy_text(file.path.clone());
+                                        ui.close();
+                                    }
+                                });
                             });
                         }
                     });
@@ -498,14 +530,23 @@ impl GitloomApp {
     }
 }
 
-fn commit_menu(ui: &mut Ui, snap: &RepoSnapshot, id: Oid, actions: &mut Vec<Action>) {
+fn commit_menu(
+    ui: &mut Ui,
+    snap: &RepoSnapshot,
+    row: usize,
+    busy: bool,
+    actions: &mut Vec<Action>,
+) {
+    let commit = &snap.commits[row];
+    let id = commit.id;
     let sha = id.to_string();
     if ui.button("Copy commit SHA").clicked() {
         ui.ctx().copy_text(sha.clone());
         ui.close();
     }
     ui.separator();
-    for &ri in snap.refs_at.get(&id).map(Vec::as_slice).unwrap_or_default() {
+    let refs = snap.refs_at.get(&id).map(Vec::as_slice).unwrap_or_default();
+    for &ri in refs {
         let r = &snap.refs[ri];
         match r.kind {
             RefKind::LocalBranch
@@ -536,4 +577,61 @@ fn commit_menu(ui: &mut Ui, snap: &RepoSnapshot, id: Oid, actions: &mut Vec<Acti
         actions.push(Action::Op(GitOp::Detach(id)));
         ui.close();
     }
+
+    let Some(head_id) = snap.head.target else {
+        return;
+    };
+    let head = snap.head.branch.as_deref().unwrap_or("HEAD");
+    let is_head = head_id == id;
+    let on_head = snap.on_head.get(row).copied().unwrap_or(false);
+    ui.separator();
+    ui.add_enabled_ui(!busy, |ui| {
+        for &ri in refs {
+            let r = &snap.refs[ri];
+            if r.kind == RefKind::Tag || r.is_head {
+                continue;
+            }
+            if ui.button(format!("Merge {} into {head}", r.name)).clicked() {
+                actions.push(Action::Op(GitOp::Merge(r.name.clone())));
+                ui.close();
+            }
+            if ui
+                .button(format!("Rebase {head} onto {}", r.name))
+                .clicked()
+            {
+                actions.push(Action::Op(GitOp::RebaseOnto(r.name.clone())));
+                ui.close();
+            }
+        }
+        if !on_head && ui.button(format!("Cherry-pick onto {head}")).clicked() {
+            actions.push(Action::Op(GitOp::CherryPick(id)));
+            ui.close();
+        }
+        if on_head {
+            let merge = commit.parents.len() > 1;
+            let revert = ui
+                .add_enabled(!merge, egui::Button::new("Revert this commit"))
+                .on_hover_text("Make a new commit that undoes this one")
+                .on_disabled_hover_text("Reverting a merge commit isn't supported yet");
+            if revert.clicked() {
+                actions.push(Action::Op(GitOp::Revert(id)));
+                ui.close();
+            }
+        }
+        if on_head
+            && ui
+                .button("Rebase interactively from here…")
+                .on_hover_text(if is_head {
+                    "Edit the latest commit"
+                } else {
+                    "Reorder, squash, reword or drop this commit and everything after it"
+                })
+                .clicked()
+        {
+            actions.push(Action::OpenRebase(id));
+            ui.close();
+        }
+    })
+    .response
+    .on_disabled_hover_text("Finish or abort the operation in progress first");
 }

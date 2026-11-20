@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use git2::{BranchType, Delta, DiffFindOptions, DiffOptions, Oid, Repository, Sort, Status};
+use git2::{
+    BranchType, Delta, DiffFindOptions, DiffOptions, Oid, Repository, RepositoryState, Sort, Status,
+};
 
+use super::conflict::ConflictKind;
 use super::graph::{self, GraphLayout};
 use crate::util;
 
@@ -93,6 +96,8 @@ pub struct RepoSnapshot {
     /// Commit -> indices into `refs`.
     pub refs_at: HashMap<Oid, Vec<usize>>,
     pub stashes: Vec<StashInfo>,
+    /// Per row of `commits`: reachable from HEAD (part of the checked-out history).
+    pub on_head: Vec<bool>,
     pub truncated: bool,
     pub load_time: Duration,
 }
@@ -190,15 +195,70 @@ pub struct StatusFile {
     pub status: char,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConflictedFile {
+    pub path: String,
+    pub kind: ConflictKind,
+}
+
+/// A multi-step operation that is waiting for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    /// `git am`
+    ApplyMailbox,
+}
+
+impl OpKind {
+    pub fn noun(self) -> &'static str {
+        match self {
+            OpKind::Merge => "merge",
+            OpKind::Rebase => "rebase",
+            OpKind::CherryPick => "cherry-pick",
+            OpKind::Revert => "revert",
+            OpKind::ApplyMailbox => "patch series",
+        }
+    }
+
+    /// `--skip` exists (a merge can only be finished or aborted).
+    pub fn can_skip(self) -> bool {
+        self != OpKind::Merge
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InProgress {
+    pub kind: OpKind,
+    /// The branch being rebased.
+    pub branch: Option<String>,
+    /// What a rebase replays onto.
+    pub onto: Option<Oid>,
+    /// The commit being merged, picked or reverted, or where a rebase stopped.
+    pub commit: Option<(Oid, String)>,
+    /// (current, total) for a rebase.
+    pub step: Option<(usize, usize)>,
+    /// First line of the prepared merge message (`Merge branch 'x'`).
+    pub title: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkingTree {
     pub unstaged: Vec<StatusFile>,
     pub staged: Vec<StatusFile>,
+    pub conflicted: Vec<ConflictedFile>,
+    pub in_progress: Option<InProgress>,
 }
 
 impl WorkingTree {
     pub fn is_clean(&self) -> bool {
-        self.unstaged.is_empty() && self.staged.is_empty()
+        self.unstaged.is_empty() && self.staged.is_empty() && self.conflicted.is_empty()
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.unstaged.len() + self.staged.len() + self.conflicted.len()
     }
 }
 
@@ -240,7 +300,21 @@ pub fn load_snapshot(root: &Path) -> Result<RepoSnapshot> {
     }
 
     let graph = graph::layout(commits.iter().map(|c| (c.id, c.parents.as_slice())));
-    let row_of = commits.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+    let row_of: HashMap<Oid, usize> = commits.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+    // Rows are topologically sorted (children first), so one pass marks HEAD's ancestry.
+    let mut on_head = vec![false; commits.len()];
+    if let Some(&row) = head.target.and_then(|t| row_of.get(&t)) {
+        on_head[row] = true;
+    }
+    for row in 0..commits.len() {
+        if on_head[row] {
+            for parent in &commits[row].parents {
+                if let Some(&p) = row_of.get(parent) {
+                    on_head[p] = true;
+                }
+            }
+        }
+    }
     let mut refs_at: HashMap<Oid, Vec<usize>> = HashMap::new();
     for (i, r) in refs.iter().enumerate() {
         refs_at.entry(r.target).or_default().push(i);
@@ -264,6 +338,7 @@ pub fn load_snapshot(root: &Path) -> Result<RepoSnapshot> {
         refs,
         refs_at,
         stashes,
+        on_head,
         truncated,
         load_time: started.elapsed(),
     })
@@ -449,13 +524,37 @@ pub fn load_status(root: &Path) -> Result<WorkingTree> {
         .include_ignored(false);
     let statuses = repo.statuses(Some(&mut opts))?;
 
-    let mut tree = WorkingTree::default();
+    let mut tree = WorkingTree {
+        in_progress: read_in_progress(&repo),
+        ..WorkingTree::default()
+    };
+    let index = repo.index()?;
+    if index.has_conflicts() {
+        for conflict in index.conflicts()? {
+            let conflict = conflict?;
+            let Some(entry) = [&conflict.our, &conflict.their, &conflict.ancestor]
+                .into_iter()
+                .flatten()
+                .next()
+            else {
+                continue;
+            };
+            tree.conflicted.push(ConflictedFile {
+                path: lossy(&entry.path),
+                kind: ConflictKind::from_stages(
+                    conflict.ancestor.is_some(),
+                    conflict.our.is_some(),
+                    conflict.their.is_some(),
+                ),
+            });
+        }
+        tree.conflicted.sort_by(|a, b| a.path.cmp(&b.path));
+    }
     for entry in statuses.iter() {
         let s = entry.status();
         let path = lossy(entry.path_bytes());
         if s.contains(Status::CONFLICTED) {
-            tree.unstaged.push(StatusFile { path, status: 'U' });
-            continue;
+            continue; // listed in `conflicted`
         }
         if let Some(status) = index_status(s) {
             tree.staged.push(StatusFile {
@@ -470,6 +569,79 @@ pub fn load_status(root: &Path) -> Result<WorkingTree> {
     tree.staged.sort_by(|a, b| a.path.cmp(&b.path));
     tree.unstaged.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(tree)
+}
+
+/// The merge, rebase, cherry-pick or revert waiting for the user, if any.
+fn read_in_progress(repo: &Repository) -> Option<InProgress> {
+    let kind = match repo.state() {
+        RepositoryState::Clean | RepositoryState::Bisect => return None,
+        RepositoryState::Merge => OpKind::Merge,
+        RepositoryState::Revert | RepositoryState::RevertSequence => OpKind::Revert,
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => OpKind::CherryPick,
+        RepositoryState::ApplyMailbox => OpKind::ApplyMailbox,
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge
+        | RepositoryState::ApplyMailboxOrRebase => OpKind::Rebase,
+    };
+    let git_dir = repo.path();
+    let read = |name: &str| {
+        std::fs::read_to_string(git_dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    let commit = |name: &str| {
+        let text = read(name)?;
+        let commit = repo
+            .revparse_single(text.lines().next()?)
+            .ok()?
+            .peel_to_commit()
+            .ok()?;
+        Some((
+            commit.id(),
+            lossy(commit.summary_bytes().unwrap_or_default()),
+        ))
+    };
+    let mut info = InProgress {
+        kind,
+        branch: None,
+        onto: None,
+        commit: None,
+        step: None,
+        title: None,
+    };
+    match kind {
+        OpKind::Rebase => {
+            let dir = if git_dir.join("rebase-merge").is_dir() {
+                "rebase-merge"
+            } else {
+                "rebase-apply"
+            };
+            let at = |name: &str| read(&format!("{dir}/{name}"));
+            info.branch = at("head-name")
+                .filter(|h| h != "detached HEAD")
+                .map(|h| h.trim_start_matches("refs/heads/").to_owned());
+            info.onto = at("onto").and_then(|o| Oid::from_str(&o).ok());
+            let (done, total) = if dir == "rebase-merge" {
+                (at("msgnum"), at("end"))
+            } else {
+                (at("next"), at("last"))
+            };
+            info.step = done
+                .zip(total)
+                .and_then(|(d, t)| Some((d.parse().ok()?, t.parse().ok()?)));
+            info.commit = commit("REBASE_HEAD").or_else(|| commit(&format!("{dir}/stopped-sha")));
+        }
+        OpKind::Merge => {
+            info.commit = commit("MERGE_HEAD");
+            info.title = read("MERGE_MSG").and_then(|m| m.lines().next().map(str::to_owned));
+        }
+        OpKind::CherryPick => info.commit = commit("CHERRY_PICK_HEAD"),
+        OpKind::Revert => info.commit = commit("REVERT_HEAD"),
+        OpKind::ApplyMailbox => {}
+    }
+    Some(info)
 }
 
 fn index_status(s: Status) -> Option<char> {
@@ -547,95 +719,127 @@ fn trim_eol(bytes: &[u8]) -> String {
 fn collect_files(diff: &git2::Diff<'_>, mut budget: usize) -> Result<(Vec<FileDiff>, bool)> {
     let mut files = Vec::new();
     let mut truncated_any = false;
-
     for idx in 0..diff.deltas().len() {
-        let Some(delta) = diff.get_delta(idx) else {
-            continue;
-        };
-        let path_of = |f: git2::DiffFile<'_>| f.path_bytes().map(|p| lossy(p).replace('\\', "/"));
-        let path = path_of(delta.new_file())
-            .or_else(|| path_of(delta.old_file()))
-            .unwrap_or_default();
-        let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
-            .then(|| path_of(delta.old_file()))
-            .flatten();
-
-        let mut file = FileDiff {
-            path,
-            old_path,
-            status: delta_status(delta.status()),
-            ..FileDiff::empty("")
-        };
-
-        match git2::Patch::from_diff(diff, idx)? {
-            None => file.binary = true,
-            Some(patch) => {
-                file.binary = patch.delta().flags().is_binary();
-                let (_, additions, deletions) = patch.line_stats()?;
-                file.additions = additions;
-                file.deletions = deletions;
-
-                'hunks: for h in 0..patch.num_hunks() {
-                    let (hunk, line_count) = patch.hunk(h)?;
-                    if budget == 0 {
-                        file.truncated = true;
-                        break;
-                    }
-                    budget -= 1;
-                    let header = file.lines.len();
-                    file.lines.push(DiffLine {
-                        kind: LineKind::Hunk,
-                        old_no: None,
-                        new_no: None,
-                        text: trim_eol(hunk.header()),
-                        raw: hunk.header().to_vec(),
-                    });
-                    for l in 0..line_count {
-                        if budget == 0 {
-                            file.truncated = true;
-                            break 'hunks;
-                        }
-                        budget -= 1;
-                        let line = patch.line_in_hunk(h, l)?;
-                        let kind = match line.origin() {
-                            '+' => LineKind::Added,
-                            '-' => LineKind::Removed,
-                            ' ' => LineKind::Context,
-                            _ => LineKind::Meta, // "\ No newline at end of file" markers
-                        };
-                        let (text, raw) = if kind == LineKind::Meta {
-                            ("\\ No newline at end of file".to_owned(), Vec::new())
-                        } else {
-                            (trim_eol(line.content()), line.content().to_vec())
-                        };
-                        file.lines.push(DiffLine {
-                            kind,
-                            old_no: line.old_lineno(),
-                            new_no: line.new_lineno(),
-                            text,
-                            raw,
-                        });
-                    }
-                    // Reached only when the whole hunk fit in the budget.
-                    file.hunks.push(Hunk {
-                        header,
-                        end: file.lines.len(),
-                        old_start: hunk.old_start(),
-                        old_lines: hunk.old_lines(),
-                        new_start: hunk.new_start(),
-                        new_lines: hunk.new_lines(),
-                    });
-                }
-            }
+        if let Some(file) = collect_file(diff, idx, &mut budget)? {
+            truncated_any |= file.truncated;
+            files.push(file);
         }
-        file.max_cols = file
-            .lines
-            .iter()
-            .map(|l| l.text.chars().count() + 1)
-            .max()
-            .unwrap_or(0);
-        truncated_any |= file.truncated;
-        files.push(file);
     }
     Ok((files, truncated_any))
+}
+
+/// How one commit changed `path` (against its first parent), renames included.
+pub fn load_commit_file_diff(root: &Path, id: Oid, path: &str) -> Result<FileDiff> {
+    let repo = Repository::open(root)?;
+    let commit = repo.find_commit(id)?;
+    let tree = commit.tree()?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3);
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+    // Rename detection needs the whole diff; keep just this file afterwards.
+    diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
+    let matches = |f: git2::DiffFile<'_>| f.path_bytes().is_some_and(|p| lossy(p) == path);
+    let found = (0..diff.deltas().len()).find(|&i| {
+        diff.get_delta(i)
+            .is_some_and(|d| matches(d.new_file()) || matches(d.old_file()))
+    });
+    let file = match found {
+        Some(idx) => collect_file(&diff, idx, &mut MAX_FILE_DIFF_LINES.clone())?,
+        None => None,
+    };
+    Ok(file.unwrap_or_else(|| FileDiff::empty(path)))
+}
+
+/// Lines of the `idx`-th file of `diff`, spending at most `budget` lines.
+fn collect_file(diff: &git2::Diff<'_>, idx: usize, budget: &mut usize) -> Result<Option<FileDiff>> {
+    let Some(delta) = diff.get_delta(idx) else {
+        return Ok(None);
+    };
+    let path_of = |f: git2::DiffFile<'_>| f.path_bytes().map(|p| lossy(p).replace('\\', "/"));
+    let path = path_of(delta.new_file())
+        .or_else(|| path_of(delta.old_file()))
+        .unwrap_or_default();
+    let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+        .then(|| path_of(delta.old_file()))
+        .flatten();
+
+    let mut file = FileDiff {
+        path,
+        old_path,
+        status: delta_status(delta.status()),
+        ..FileDiff::empty("")
+    };
+
+    match git2::Patch::from_diff(diff, idx)? {
+        None => file.binary = true,
+        Some(patch) => {
+            file.binary = patch.delta().flags().is_binary();
+            let (_, additions, deletions) = patch.line_stats()?;
+            file.additions = additions;
+            file.deletions = deletions;
+
+            'hunks: for h in 0..patch.num_hunks() {
+                let (hunk, line_count) = patch.hunk(h)?;
+                if *budget == 0 {
+                    file.truncated = true;
+                    break;
+                }
+                *budget -= 1;
+                let header = file.lines.len();
+                file.lines.push(DiffLine {
+                    kind: LineKind::Hunk,
+                    old_no: None,
+                    new_no: None,
+                    text: trim_eol(hunk.header()),
+                    raw: hunk.header().to_vec(),
+                });
+                for l in 0..line_count {
+                    if *budget == 0 {
+                        file.truncated = true;
+                        break 'hunks;
+                    }
+                    *budget -= 1;
+                    let line = patch.line_in_hunk(h, l)?;
+                    let kind = match line.origin() {
+                        '+' => LineKind::Added,
+                        '-' => LineKind::Removed,
+                        ' ' => LineKind::Context,
+                        _ => LineKind::Meta, // "\ No newline at end of file" markers
+                    };
+                    let (text, raw) = if kind == LineKind::Meta {
+                        ("\\ No newline at end of file".to_owned(), Vec::new())
+                    } else {
+                        (trim_eol(line.content()), line.content().to_vec())
+                    };
+                    file.lines.push(DiffLine {
+                        kind,
+                        old_no: line.old_lineno(),
+                        new_no: line.new_lineno(),
+                        text,
+                        raw,
+                    });
+                }
+                // Reached only when the whole hunk fit in the budget.
+                file.hunks.push(Hunk {
+                    header,
+                    end: file.lines.len(),
+                    old_start: hunk.old_start(),
+                    old_lines: hunk.old_lines(),
+                    new_start: hunk.new_start(),
+                    new_lines: hunk.new_lines(),
+                });
+            }
+        }
+    }
+    file.max_cols = file
+        .lines
+        .iter()
+        .map(|l| l.text.chars().count() + 1)
+        .max()
+        .unwrap_or(0);
+    Ok(Some(file))
 }

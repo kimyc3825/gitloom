@@ -7,7 +7,10 @@ use eframe::egui;
 use git2::Oid;
 
 use crate::forge::{ForgeError, ForgeSnapshot};
-use crate::git::ops::GitOp;
+use crate::git::blame::{Blame, FileCommit};
+use crate::git::conflict::MergeDoc;
+use crate::git::ops::{GitOp, Outcome};
+use crate::git::rebase::Plan;
 use crate::git::repo::{CommitDetail, FileDiff, RepoSnapshot, WorkingTree};
 
 pub enum JobResult {
@@ -34,11 +37,31 @@ pub enum JobResult {
     },
     GitOp {
         op: GitOp,
-        result: anyhow::Result<String>,
+        result: anyhow::Result<Outcome>,
     },
     PrCheckout {
         number: u64,
         result: Result<String, ForgeError>,
+    },
+    /// A conflicted file, parsed for the merge view.
+    Conflict(MergeDoc),
+    RebasePlan {
+        from: Oid,
+        result: anyhow::Result<Plan>,
+    },
+    FileHistory {
+        path: String,
+        result: anyhow::Result<(Vec<FileCommit>, bool)>,
+    },
+    Blame {
+        path: String,
+        rev: Option<Oid>,
+        result: anyhow::Result<Blame>,
+    },
+    /// How one commit of a file's history changed the file.
+    FileCommitDiff {
+        id: Oid,
+        result: anyhow::Result<FileDiff>,
     },
 }
 

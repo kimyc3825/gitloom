@@ -20,6 +20,16 @@ impl GitloomApp {
         };
         let now = util::now_secs();
         let mut actions = Vec::new();
+        let head = snap.head.target.map(|_| {
+            snap.head
+                .branch
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_owned())
+        });
+        let busy = self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.in_progress.is_some());
 
         ScrollArea::vertical()
             .id_salt("sidebar")
@@ -120,7 +130,9 @@ impl GitloomApp {
                                     center: true,
                                 });
                             }
-                            response.context_menu(|ui| ref_menu(ui, r, &mut actions));
+                            response.context_menu(|ui| {
+                                ref_menu(ui, r, head.as_deref(), busy, &mut actions)
+                            });
                         }
                     });
                 }
@@ -159,9 +171,37 @@ impl GitloomApp {
     }
 }
 
-fn ref_menu(ui: &mut Ui, r: &RefInfo, actions: &mut Vec<Action>) {
+fn ref_menu(ui: &mut Ui, r: &RefInfo, head: Option<&str>, busy: bool, actions: &mut Vec<Action>) {
     let local = r.kind == RefKind::LocalBranch;
     let remote = r.kind == RefKind::RemoteBranch;
+    if let Some(head) = head.filter(|_| (local || remote) && !r.is_head) {
+        ui.add_enabled_ui(!busy, |ui| {
+            if ui.button(format!("Merge {} into {head}", r.name)).clicked() {
+                actions.push(Action::Op(GitOp::Merge(r.name.clone())));
+                ui.close();
+            }
+            if ui
+                .button(format!("Rebase {head} onto {}", r.name))
+                .clicked()
+            {
+                actions.push(Action::Op(GitOp::RebaseOnto(r.name.clone())));
+                ui.close();
+            }
+        })
+        .response
+        .on_disabled_hover_text("Finish or abort the operation in progress first");
+        ui.separator();
+    }
+    if r.is_head
+        && let Some(upstream) = &r.upstream
+        && ui
+            .button("Force push (with lease)…")
+            .on_hover_text("Overwrite the remote branch after rewriting history")
+            .clicked()
+    {
+        actions.push(Action::confirm(force_push(r, upstream)));
+        ui.close();
+    }
     if local && !r.is_head && ui.button(format!("Switch to {}", r.name)).clicked() {
         actions.push(Action::Op(GitOp::Switch(r.name.clone())));
         ui.close();
@@ -182,14 +222,14 @@ fn ref_menu(ui: &mut Ui, r: &RefInfo, actions: &mut Vec<Action>) {
     if local && !r.is_head {
         ui.separator();
         if ui.button("Delete branch…").clicked() {
-            actions.push(Action::Confirm(delete_branch(r)));
+            actions.push(Action::confirm(delete_branch(r)));
             ui.close();
         }
     }
     if remote {
         ui.separator();
         if ui.button("Delete on remote…").clicked() {
-            actions.push(Action::Confirm(delete_remote_branch(r)));
+            actions.push(Action::confirm(delete_remote_branch(r)));
             ui.close();
         }
     }
@@ -215,6 +255,23 @@ fn delete_branch(r: &RefInfo) -> Confirm {
                 force: true,
             },
         }),
+    }
+}
+
+fn force_push(r: &RefInfo, upstream: &str) -> Confirm {
+    Confirm {
+        title: "Force push?".to_owned(),
+        message: format!(
+            "Replace {upstream} with your local {}? Commits on the remote that aren't in your branch are lost. \
+             With --force-with-lease git refuses if someone else pushed in the meantime.",
+            r.name
+        ),
+        confirm_label: "Force push".to_owned(),
+        op: GitOp::Push {
+            set_upstream: None,
+            force: true,
+        },
+        toggle: None,
     }
 }
 
@@ -248,7 +305,7 @@ fn stash_menu(ui: &mut Ui, stash: &StashInfo, actions: &mut Vec<Action>) {
     }
     ui.separator();
     if ui.button("Drop…").clicked() {
-        actions.push(Action::Confirm(Confirm {
+        actions.push(Action::confirm(Confirm {
             title: "Drop stash?".to_owned(),
             message: format!(
                 "Delete stash@{{{}}} ({})? This can't be undone.",

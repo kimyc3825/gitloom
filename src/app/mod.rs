@@ -2,8 +2,11 @@
 
 mod changes;
 mod dialogs;
+mod file_view;
 mod forge_panel;
 mod history;
+mod merge;
+mod rebase;
 mod sidebar;
 #[cfg(test)]
 mod ui_tests;
@@ -14,8 +17,13 @@ use std::path::PathBuf;
 use eframe::egui::{self, Align, Color32, Key, Layout, Modifiers, RichText, Ui};
 use git2::Oid;
 
+use self::file_view::{FileAction, FileMode, FileView};
+use self::merge::MergeView;
+use self::rebase::RebaseDialog;
 use crate::forge::{ForgeError, ForgeSnapshot, github};
-use crate::git::ops::GitOp;
+use crate::git::conflict;
+use crate::git::ops::{GitOp, Outcome};
+use crate::git::rebase as rebase_plan;
 use crate::git::repo::{self, CommitDetail, FileDiff, RefKind, RepoSnapshot, WorkingTree};
 use crate::jobs::{JobResult, Jobs};
 use crate::ui::diff::DiffEvent;
@@ -25,6 +33,13 @@ use crate::ui::graph::ROW_HEIGHT;
 enum View {
     History,
     Changes,
+    /// History or blame of one file.
+    File,
+}
+
+/// `1 file` / `3 files`
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,10 +75,30 @@ enum Action {
     /// Line selection or hunk/line buttons in the working-tree diff.
     Diff(DiffEvent),
     /// Ask before running a destructive operation.
-    Confirm(Confirm),
+    Confirm(Box<Confirm>),
     OpenStashDialog,
     /// Show a stash's changes in the commit detail panel.
     ShowStash(Oid),
+    /// Open a conflicted file in the merge view.
+    SelectConflict(String),
+    /// Switch to the Changes view and its first conflict.
+    ShowConflicts,
+    /// Open the interactive rebase dialog for `from`..HEAD.
+    OpenRebase(Oid),
+    OpenFile {
+        path: String,
+        mode: FileMode,
+        rev: Option<Oid>,
+    },
+    File(FileAction),
+    /// Select a commit in the graph, switching to the History view.
+    ShowCommit(Oid),
+}
+
+impl Action {
+    fn confirm(confirm: Confirm) -> Self {
+        Action::Confirm(Box::new(confirm))
+    }
 }
 
 struct Message {
@@ -143,6 +178,14 @@ pub struct GitloomApp {
     /// Index into `snapshot.refs` -> index into the forge's pull requests.
     pr_for_ref: HashMap<usize, usize>,
 
+    /// Conflicted file shown in the merge view (instead of `selected_change`).
+    selected_conflict: Option<String>,
+    merge: Option<MergeView>,
+    /// After an operation stopped on conflicts: show them once the status arrives.
+    focus_conflicts: bool,
+    rebase_dialog: Option<RebaseDialog>,
+    file_view: Option<FileView>,
+
     running_ops: usize,
     busy_label: Option<String>,
     message: Option<Message>,
@@ -189,6 +232,11 @@ impl GitloomApp {
             forge_tab: ForgeTab::Pulls,
             selected_pr: None,
             pr_for_ref: HashMap::new(),
+            selected_conflict: None,
+            merge: None,
+            focus_conflicts: false,
+            rebase_dialog: None,
+            file_view: None,
             running_ops: 0,
             busy_label: None,
             message: None,
@@ -235,6 +283,11 @@ impl GitloomApp {
         self.branch_dialog = None;
         self.confirm = None;
         self.stash_dialog = None;
+        self.selected_conflict = None;
+        self.merge = None;
+        self.focus_conflicts = false;
+        self.rebase_dialog = None;
+        self.file_view = None;
         self.forge = ForgeState::Idle;
         self.selected_pr = None;
         self.pr_for_ref.clear();
@@ -328,6 +381,8 @@ impl GitloomApp {
             self.diff_selection.clear();
             self.diff_anchor = None;
         }
+        self.selected_conflict = None;
+        self.merge = None;
         self.selected_change = Some((path.clone(), staged));
         self.jobs.spawn(move || {
             let result = repo::load_file_diff(&root, &path, staged);
@@ -336,6 +391,45 @@ impl GitloomApp {
                 staged,
                 result,
             }
+        });
+    }
+
+    /// Show a conflicted file in the merge view (reloading it from disk).
+    fn select_conflict(&mut self, path: String) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let Some(kind) = self
+            .status
+            .as_ref()
+            .and_then(|s| s.conflicted.iter().find(|c| c.path == path).map(|c| c.kind))
+        else {
+            return;
+        };
+        if self.selected_conflict.as_ref() != Some(&path) {
+            self.merge = None;
+        }
+        self.selected_conflict = Some(path.clone());
+        self.selected_change = None;
+        self.change_diff = None;
+        self.jobs
+            .spawn(move || JobResult::Conflict(conflict::load(&root, &path, kind)));
+    }
+
+    fn open_rebase(&mut self, from: Oid) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let dirty = self.status.as_ref().is_some_and(|s| !s.is_clean());
+        self.rebase_dialog = Some(RebaseDialog {
+            from,
+            plan: None,
+            selected: None,
+            dirty,
+        });
+        self.jobs.spawn(move || JobResult::RebasePlan {
+            from,
+            result: rebase_plan::load(&root, from),
         });
     }
 
@@ -379,6 +473,7 @@ impl GitloomApp {
             .is_none_or(|r| r.upstream.is_some());
         GitOp::Push {
             set_upstream: (!has_upstream).then(|| "origin".to_owned()),
+            force: false,
         }
     }
 
@@ -504,7 +599,7 @@ impl GitloomApp {
                 JobResult::GitOp { op, result } => {
                     self.finish_op();
                     match result {
-                        Ok(output) => {
+                        Ok(Outcome::Done(output)) => {
                             if matches!(op, GitOp::Commit { .. }) {
                                 self.commit_message.clear();
                                 self.amend = false;
@@ -515,6 +610,25 @@ impl GitloomApp {
                                 .map(|l| format!(": {l}"))
                                 .unwrap_or_default();
                             self.set_info(format!("{} — done{detail}", op.label()));
+                            if let GitOp::InteractiveRebase(plan) = &op
+                                && plan.pushed_count() > 0
+                            {
+                                self.set_info(format!(
+                                    "{} — done. {} already on {}: force-push to update it.",
+                                    op.label(),
+                                    plural(
+                                        plan.pushed_count(),
+                                        "rewritten commit was",
+                                        "rewritten commits were"
+                                    ),
+                                    plan.upstream.as_deref().unwrap_or("the remote"),
+                                ));
+                            }
+                        }
+                        Ok(Outcome::Stopped(text)) => {
+                            self.set_info(format!("{} stopped: {text}", op.label()));
+                            // Take the user to the files that need them.
+                            self.focus_conflicts = true;
                         }
                         Err(e) => self.set_error(format!("{} failed: {e:#}", op.label())),
                     }
@@ -531,6 +645,34 @@ impl GitloomApp {
                         Err(e) => self.set_error(format!("Checking out #{number} failed: {e}")),
                     }
                     self.refresh(false);
+                }
+                JobResult::Conflict(doc) => {
+                    if self.selected_conflict.as_ref() != Some(&doc.path) {
+                        continue;
+                    }
+                    // A refresh with the same content keeps the choices made so far.
+                    if !self.merge.as_ref().is_some_and(|m| m.same_content(&doc)) {
+                        self.merge = Some(MergeView::new(doc));
+                    }
+                }
+                JobResult::RebasePlan { from, result } => {
+                    let Some(dialog) = self.rebase_dialog.as_mut().filter(|d| d.from == from)
+                    else {
+                        continue;
+                    };
+                    dialog.plan = Some(
+                        result
+                            .map(|mut plan| {
+                                plan.autostash = dialog.dirty;
+                                plan
+                            })
+                            .map_err(|e| format!("{e:#}")),
+                    );
+                }
+                JobResult::FileHistory { path, result } => self.apply_file_history(path, result),
+                JobResult::Blame { path, rev, result } => self.apply_blame(path, rev, result),
+                JobResult::FileCommitDiff { id, result } => {
+                    self.apply_file_commit_diff(id, result);
                 }
             }
         }
@@ -561,6 +703,30 @@ impl GitloomApp {
     }
 
     fn apply_status(&mut self, status: WorkingTree) {
+        let still_conflicted = |path: &str| status.conflicted.iter().any(|c| c.path == path);
+        let reload_conflict = match &self.selected_conflict {
+            Some(path) if still_conflicted(path) => Some(path.clone()),
+            Some(_) => {
+                // Resolved: move on to the next conflicted file, if any.
+                self.selected_conflict = None;
+                self.merge = None;
+                status.conflicted.first().map(|c| c.path.clone())
+            }
+            None => None,
+        };
+        let first_conflict = status.conflicted.first().map(|c| c.path.clone());
+        if std::mem::take(&mut self.focus_conflicts)
+            && let Some(first) = &first_conflict
+        {
+            self.view = View::Changes;
+            if self.selected_conflict.is_none() {
+                self.selected_change = None;
+                self.change_diff = None;
+                self.status = Some(status);
+                self.select_conflict(first.clone());
+                return;
+            }
+        }
         if let Some((path, staged)) = self.selected_change.clone() {
             let list = if staged {
                 &status.staged
@@ -576,6 +742,10 @@ impl GitloomApp {
             }
         }
         self.status = Some(status);
+        if let Some(path) = reload_conflict {
+            // The file may have been edited elsewhere; same content keeps the choices.
+            self.select_conflict(path);
+        }
     }
 
     fn process_actions(&mut self) {
@@ -607,7 +777,7 @@ impl GitloomApp {
                 Action::Refresh => self.refresh(true),
                 Action::RefreshForge => self.refresh_forge(),
                 Action::Diff(event) => self.handle_diff_event(event),
-                Action::Confirm(confirm) => self.confirm = Some(confirm),
+                Action::Confirm(confirm) => self.confirm = Some(*confirm),
                 Action::OpenStashDialog => {
                     self.stash_dialog = Some(StashDialog {
                         message: String::new(),
@@ -618,6 +788,24 @@ impl GitloomApp {
                 Action::ShowStash(id) => {
                     self.view = View::History;
                     self.select_commit(id, false);
+                }
+                Action::SelectConflict(path) => self.select_conflict(path),
+                Action::ShowConflicts => {
+                    self.view = View::Changes;
+                    let first = self
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conflicted.first().map(|c| c.path.clone()));
+                    if let (None, Some(first)) = (&self.selected_conflict, first) {
+                        self.select_conflict(first);
+                    }
+                }
+                Action::OpenRebase(from) => self.open_rebase(from),
+                Action::OpenFile { path, mode, rev } => self.open_file(path, mode, rev),
+                Action::File(action) => self.handle_file_action(action),
+                Action::ShowCommit(id) => {
+                    self.view = View::History;
+                    self.select_commit(id, true);
                 }
             }
         }
@@ -643,7 +831,11 @@ impl GitloomApp {
             self.view = View::History;
             self.focus_search = true;
         }
-        if self.view != View::History || ctx.egui_wants_keyboard_input() {
+        let dialog_open = self.rebase_dialog.is_some()
+            || self.confirm.is_some()
+            || self.branch_dialog.is_some()
+            || self.stash_dialog.is_some();
+        if self.view != View::History || dialog_open || ctx.egui_wants_keyboard_input() {
             return;
         }
         let Some(snap) = &self.snapshot else { return };
@@ -815,16 +1007,29 @@ impl GitloomApp {
                 View::History,
                 RichText::new("History").strong(),
             );
-            let changes = self
-                .status
-                .as_ref()
-                .map_or(0, |s| s.staged.len() + s.unstaged.len());
+            let changes = self.status.as_ref().map_or(0, WorkingTree::change_count);
             let label = if changes > 0 {
                 format!("Changes ({changes})")
             } else {
                 "Changes".to_owned()
             };
             ui.selectable_value(&mut self.view, View::Changes, RichText::new(label).strong());
+            if let Some(file) = &self.file_view {
+                let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+                ui.selectable_value(
+                    &mut self.view,
+                    View::File,
+                    RichText::new(format!("File: {name}")).strong(),
+                )
+                .on_hover_text(&file.path);
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Close the file view")
+                    .clicked()
+                {
+                    self.actions.push(Action::File(FileAction::Close));
+                }
+            }
         });
         ui.separator();
     }
@@ -857,10 +1062,12 @@ impl eframe::App for GitloomApp {
                 .min_size(240.0)
                 .show(ui, |ui| self.forge_panel(ui));
             egui::CentralPanel::default_margins().show(ui, |ui| {
+                self.operation_banner(ui);
                 self.view_tabs(ui);
                 match self.view {
                     View::History => self.history_view(ui),
                     View::Changes => self.changes_view(ui),
+                    View::File => self.file_view_ui(ui),
                 }
             });
         }

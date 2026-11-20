@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui;
-use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::{Harness, Node};
 
-use super::{ForgeState, GitloomApp};
+use super::{ForgeState, GitloomApp, View};
 use crate::forge::{CheckSummary, ForgeSnapshot, PullRequest, ReviewState};
 use crate::git::ops::{git, git_bytes};
 
@@ -389,5 +389,275 @@ fn pull_request_card_jumps_to_its_branch() {
     wait_until(&mut harness, "the PR's commit to be selected", |app| {
         app.selected == Some(target)
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `main` and `topic` both change the middle line of f.txt.
+fn diverged(name: &str) -> PathBuf {
+    let dir = temp_repo(name);
+    commit(&dir, "f.txt", "top\nmiddle\nbottom\n", "base");
+    git(&dir, &["switch", "-q", "-c", "topic"], None).unwrap();
+    commit(
+        &dir,
+        "f.txt",
+        "top\nmiddle from topic\nbottom\n",
+        "topic change",
+    );
+    git(&dir, &["switch", "-q", "main"], None).unwrap();
+    commit(
+        &dir,
+        "f.txt",
+        "top\nmiddle from main\nbottom\n",
+        "main change",
+    );
+    dir
+}
+
+fn summaries(dir: &Path) -> Vec<String> {
+    git(dir, &["log", "--format=%s", "--reverse"], None)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The clickable widget with this label: not a graph row (a list item) and
+/// not the commit detail's summary text (a label).
+fn button<'a>(harness: &'a Harness<'_, GitloomApp>, label: &'a str) -> Node<'a> {
+    harness
+        .get_all_by_label(label)
+        .find(|n| {
+            !matches!(
+                n.accesskit_node().role(),
+                egui::Role::ListItem | egui::Role::Label
+            )
+        })
+        .unwrap_or_else(|| panic!("no button labelled {label:?}"))
+}
+
+#[test]
+fn merge_from_the_sidebar_and_resolve_in_the_merge_view() {
+    let dir = diverged("merge");
+    let mut harness = open(&dir);
+    harness.get_by_label("topic").click_secondary();
+    settle(&mut harness);
+    harness.get_by_label("Merge topic into main").click();
+    wait_until(&mut harness, "the merge to stop on the conflict", |app| {
+        app.merge.as_ref().is_some_and(|m| m.choices.len() == 1)
+    });
+    assert!(
+        harness.state().view == View::Changes,
+        "the conflict is shown right away"
+    );
+    harness.get_by_label_contains("Merge in progress");
+
+    harness.get_by_label("Take theirs").click();
+    settle(&mut harness);
+    harness.get_by_label("Save and mark resolved").click();
+    wait_until(&mut harness, "the file to be resolved", |app| {
+        app.status.as_ref().is_some_and(|s| s.conflicted.is_empty())
+    });
+    harness.get_by_label("Commit merge").click();
+    wait_until(&mut harness, "the merge commit", |app| {
+        app.status.as_ref().is_some_and(|s| s.in_progress.is_none())
+            && app
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.commits[0].parents.len() == 2)
+    });
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "top\nmiddle from topic\nbottom\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn abort_a_stopped_rebase_from_the_banner() {
+    let dir = diverged("abort");
+    git(&dir, &["switch", "-q", "topic"], None).unwrap();
+    assert!(
+        git(&dir, &["rebase", "main"], None).is_err(),
+        "stops on the conflict"
+    );
+
+    let mut harness = open(&dir);
+    harness.get_by_label_contains("Rebasing topic onto");
+    harness.get_by_label("Abort rebase…").click();
+    settle(&mut harness);
+    harness.get_by_label("Abort rebase").click();
+    wait_until(&mut harness, "the rebase to be aborted", |app| {
+        app.status
+            .as_ref()
+            .is_some_and(|s| s.in_progress.is_none() && s.is_clean())
+    });
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "top\nmiddle from topic\nbottom\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn open_rebase_dialog(harness: &mut Harness<'_, GitloomApp>, from: &str) {
+    harness
+        .get_by_role_and_label(egui::Role::ListItem, from)
+        .click_secondary();
+    settle(harness);
+    harness
+        .get_by_label("Rebase interactively from here…")
+        .click();
+    wait_until(harness, "the rebase plan", |app| {
+        app.rebase_dialog
+            .as_ref()
+            .is_some_and(|d| matches!(d.plan, Some(Ok(_))))
+    });
+}
+
+fn plan_order(harness: &Harness<'_, GitloomApp>) -> Vec<String> {
+    match &harness.state().rebase_dialog.as_ref().unwrap().plan {
+        Some(Ok(plan)) => plan.items.iter().map(|i| i.summary.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[test]
+fn interactive_rebase_with_keyboard_shortcuts() {
+    let dir = temp_repo("rebase-keys");
+    for word in ["one", "two", "three", "four"] {
+        commit(&dir, &format!("{word}.txt"), &format!("{word}\n"), word);
+    }
+    let mut harness = open(&dir);
+    open_rebase_dialog(&mut harness, "two");
+    assert_eq!(plan_order(&harness), ["two", "three", "four"]);
+
+    // Highlight a row, then use git's todo letters: squash three, drop four.
+    button(&harness, "three").click();
+    settle(&mut harness);
+    harness.key_press(egui::Key::S);
+    settle(&mut harness);
+    button(&harness, "four").click();
+    settle(&mut harness);
+    harness.key_press(egui::Key::D);
+    settle(&mut harness);
+    harness.get_by_label("Start rebase").click();
+    wait_until(&mut harness, "the rebase to finish", |app| {
+        app.rebase_dialog.is_none() && app.snapshot.as_ref().is_some_and(|s| s.commits.len() == 2)
+    });
+
+    assert_eq!(summaries(&dir), ["one", "two"]);
+    let message = git(&dir, &["log", "-1", "--format=%B"], None).unwrap();
+    assert!(
+        message.contains("three"),
+        "squash keeps both messages: {message}"
+    );
+    assert!(dir.join("three.txt").exists() && !dir.join("four.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drag_a_commit_to_reorder_it() {
+    let dir = temp_repo("rebase-drag");
+    for word in ["one", "two", "three"] {
+        commit(&dir, &format!("{word}.txt"), &format!("{word}\n"), word);
+    }
+    let mut harness = open(&dir);
+    open_rebase_dialog(&mut harness, "two");
+
+    // Newest first: the handle of "three" sits above the one of "two".
+    let mut handles: Vec<egui::Rect> = harness
+        .get_all_by_label("Reorder")
+        .map(|n| n.rect())
+        .collect();
+    handles.sort_by(|a, b| a.top().total_cmp(&b.top()));
+    assert_eq!(handles.len(), 2);
+    let from = handles[0].center();
+    let below_two = egui::pos2(from.x + 150.0, handles[1].bottom() - 1.0);
+    harness.drag_at(from);
+    harness.step();
+    harness.hover_at(from + egui::vec2(0.0, 12.0));
+    harness.step();
+    harness.hover_at(below_two);
+    harness.step();
+    harness.step();
+    // Release without the pointer leaving, so the row under it takes the drop.
+    harness.event(egui::Event::PointerButton {
+        pos: below_two,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(&mut harness);
+    assert_eq!(
+        plan_order(&harness),
+        ["three", "two"],
+        "three is now the oldest"
+    );
+
+    harness.get_by_label("Start rebase").click();
+    wait_until(&mut harness, "the rebase to finish", |app| {
+        app.rebase_dialog.is_none()
+            && app
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.commits.first().is_some_and(|c| c.summary == "two"))
+    });
+    assert_eq!(summaries(&dir), ["one", "three", "two"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_history_and_blame_from_the_commit_detail() {
+    let dir = temp_repo("blame");
+    commit(&dir, "f.txt", "alpha\nbeta\n", "add f");
+    commit(&dir, "f.txt", "alpha\nBETA\n", "shout beta");
+    commit(&dir, "g.txt", "x\n", "unrelated");
+
+    let mut harness = open(&dir);
+    harness
+        .get_by_role_and_label(egui::Role::ListItem, "shout beta")
+        .click();
+    wait_until(&mut harness, "the commit detail", |app| {
+        app.detail
+            .as_ref()
+            .is_some_and(|d| d.files.iter().any(|f| f.path == "f.txt"))
+    });
+    button(&harness, "f.txt").click_secondary();
+    settle(&mut harness);
+    harness.get_by_label("File history").click();
+    wait_until(&mut harness, "the file history", |app| {
+        app.file_view
+            .as_ref()
+            .is_some_and(|f| f.entry_diff.is_some())
+    });
+    let entries: Vec<String> = match &harness.state().file_view.as_ref().unwrap().history {
+        Some(Ok((entries, _))) => entries.iter().map(|e| e.summary.clone()).collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(entries, ["shout beta", "add f"]);
+
+    harness.get_by_label("Blame").click();
+    wait_until(&mut harness, "the blame", |app| {
+        app.file_view
+            .as_ref()
+            .is_some_and(|f| matches!(f.blame, Some(Ok(_))))
+    });
+    harness
+        .get_by_role_and_label(egui::Role::ListItem, "BETA")
+        .click();
+    settle(&mut harness);
+    harness.get_by_label("Show in graph").click();
+    settle(&mut harness);
+    let app = harness.state();
+    assert!(app.view == View::History);
+    let expected = app
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .commits
+        .iter()
+        .find(|c| c.summary == "shout beta")
+        .unwrap()
+        .id;
+    assert_eq!(app.selected, Some(expected));
     let _ = std::fs::remove_dir_all(&dir);
 }

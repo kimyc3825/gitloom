@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 
 use eframe::egui::{self, Align, Key, Layout, Modifiers, RichText, ScrollArea, Ui};
 
-use super::{Action, Confirm, GitloomApp};
+use super::file_view::FileMode;
+use super::{Action, Confirm, GitloomApp, merge};
 use crate::git::ops::GitOp;
 use crate::git::patch::{self, PatchMode};
 use crate::git::repo::StatusFile;
@@ -23,6 +24,10 @@ impl GitloomApp {
                 egui::CentralPanel::no_frame().show(ui, |ui| self.change_lists(ui));
             });
 
+        if self.selected_conflict.is_some() {
+            diff::panel().show(ui, |ui| self.merge_view(ui));
+            return;
+        }
         let mut event = None;
         diff::panel().show(ui, |ui| match (&self.selected_change, &self.change_diff) {
             (Some((_, staged)), Some(file)) => {
@@ -68,10 +73,20 @@ impl GitloomApp {
             }
         });
         ui.add_space(4.0);
+        let selected_conflict = self.selected_conflict.as_deref();
         ScrollArea::vertical()
             .id_salt("change_lists")
             .auto_shrink(false)
             .show(ui, |ui| {
+                if !status.conflicted.is_empty() {
+                    merge::conflict_section(
+                        ui,
+                        &status.conflicted,
+                        selected_conflict,
+                        &mut actions,
+                    );
+                    ui.add_space(10.0);
+                }
                 section(
                     ui,
                     "Unstaged",
@@ -329,7 +344,7 @@ fn file_menu(ui: &mut Ui, file: &StatusFile, staged: bool, actions: &mut Vec<Act
                     file.path
                 )
             };
-            actions.push(Action::Confirm(Confirm {
+            actions.push(Action::confirm(Confirm {
                 title: if untracked {
                     "Delete file?"
                 } else {
@@ -353,6 +368,25 @@ fn file_menu(ui: &mut Ui, file: &StatusFile, staged: bool, actions: &mut Vec<Act
         }
     }
     ui.separator();
+    if file.status != '?' {
+        for (label, mode) in [
+            ("File history", FileMode::History),
+            ("Blame", FileMode::Blame),
+        ] {
+            // A deleted file has nothing left in the working tree to blame.
+            if mode == FileMode::Blame && file.status == 'D' {
+                continue;
+            }
+            if ui.button(label).clicked() {
+                actions.push(Action::OpenFile {
+                    path: file.path.clone(),
+                    mode,
+                    rev: None,
+                });
+                ui.close();
+            }
+        }
+    }
     if ui.button("Copy path").clicked() {
         ui.ctx().copy_text(file.path.clone());
         ui.close();
