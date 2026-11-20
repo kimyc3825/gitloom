@@ -4,10 +4,18 @@
 pub mod diff;
 pub mod graph;
 
-use eframe::egui::{self, Align2, Color32, FontId, Painter, Rect, Sense, Ui, pos2, vec2};
+use std::sync::Arc;
+
+use eframe::egui::text::{LayoutJob, TextWrapping};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Galley, Painter, Rect, Sense, TextFormat, Ui, pos2, vec2,
+};
 
 use crate::forge::{CheckState, PullRequest, ReviewState};
 use crate::git::repo::{RefInfo, RefKind};
+
+/// Chips never get wider than this (plus padding); longer names are elided.
+const MAX_CHIP_TEXT: f32 = 190.0;
 
 const LANE_COLORS: [Color32; 10] = [
     Color32::from_rgb(66, 165, 245),
@@ -139,15 +147,26 @@ impl Chip {
         FontId::proportional(if self.strong { 12.0 } else { 11.5 })
     }
 
+    /// Single-line text, elided with "…" beyond `MAX_CHIP_TEXT` (long remote branch names).
+    fn galley(&self, painter: &Painter) -> Arc<Galley> {
+        let mut job = LayoutJob::single_section(
+            self.text.clone(),
+            TextFormat::simple(self.font(), self.text_color),
+        );
+        job.wrap = TextWrapping::truncate_at_width(MAX_CHIP_TEXT);
+        painter.layout_job(job)
+    }
+
     pub fn size(&self, painter: &Painter) -> egui::Vec2 {
-        let galley = painter.layout_no_wrap(self.text.clone(), self.font(), self.text_color);
         let dot = if self.dot.is_some() { 10.0 } else { 0.0 };
-        vec2(galley.size().x + 10.0 + dot, 17.0)
+        vec2(self.galley(painter).size().x + 10.0 + dot, 17.0)
     }
 
     /// Paint with the left edge at `x`, vertically centered on `y`. Returns the right edge.
     pub fn paint(&self, painter: &Painter, x: f32, y: f32) -> f32 {
-        let size = self.size(painter);
+        let galley = self.galley(painter);
+        let dot = if self.dot.is_some() { 10.0 } else { 0.0 };
+        let size = vec2(galley.size().x + 10.0 + dot, 17.0);
         let rect = Rect::from_min_size(pos2(x, y - size.y / 2.0), size);
         painter.rect_filled(rect, 4.0, self.fill);
         let mut text_x = rect.left() + 5.0;
@@ -155,20 +174,26 @@ impl Chip {
             painter.circle_filled(pos2(text_x + 3.5, y), 3.5, dot);
             text_x += 10.0;
         }
-        painter.text(
-            pos2(text_x, y),
-            Align2::LEFT_CENTER,
-            &self.text,
-            self.font(),
-            self.text_color,
-        );
+        let text_pos = Align2::LEFT_CENTER
+            .anchor_size(pos2(text_x, y), galley.size())
+            .min;
+        painter.galley(text_pos, galley, self.text_color);
         rect.right()
     }
 
-    /// Allocate space in a normal layout and paint the chip there.
+    /// Allocate space in a normal layout and paint the chip there (decoration only).
     pub fn show(&self, ui: &mut Ui) -> egui::Response {
+        self.show_with_sense(ui, Sense::hover())
+    }
+
+    /// Like [`Self::show`], but the chip reacts to clicks.
+    pub fn show_clickable(&self, ui: &mut Ui) -> egui::Response {
+        self.show_with_sense(ui, Sense::click())
+    }
+
+    fn show_with_sense(&self, ui: &mut Ui, sense: Sense) -> egui::Response {
         let size = self.size(ui.painter());
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let (rect, response) = ui.allocate_exact_size(size, sense);
         self.paint(ui.painter(), rect.left(), rect.center().y);
         response
     }

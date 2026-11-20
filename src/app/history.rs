@@ -49,7 +49,9 @@ impl GitloomApp {
         } else {
             SHA_W
         };
-        let graph_w = graph_ui::graph_width(&snap.graph);
+        // Repos with hundreds of branches can need dozens of lanes; keep room for text.
+        let graph_w =
+            graph_ui::graph_width(&snap.graph).min((ui.available_width() * 0.35).max(44.0));
         let visuals = ui.visuals().clone();
         let weak = visuals.weak_text_color();
         let now = util::now_secs();
@@ -70,14 +72,16 @@ impl GitloomApp {
             font.clone(),
             weak,
         );
-        hp.text(
-            pos2(header.left() + graph_w + 6.0, hy),
-            Align2::LEFT_CENTER,
-            "Description",
-            font.clone(),
-            weak,
-        );
         let mut hx = header.right() - right_w;
+        if header.left() + graph_w + 80.0 < hx {
+            hp.text(
+                pos2(header.left() + graph_w + 6.0, hy),
+                Align2::LEFT_CENTER,
+                "Description",
+                font.clone(),
+                weak,
+            );
+        }
         if wide {
             hp.text(
                 pos2(hx, hy),
@@ -337,10 +341,9 @@ impl GitloomApp {
                                         .monospace()
                                         .color(ui::status_color(file.status)),
                                 );
-                                if ui
-                                    .selectable_label(selected_file == i, &file.path)
-                                    .clicked()
-                                {
+                                let item = egui::Button::selectable(selected_file == i, &file.path)
+                                    .truncate();
+                                if ui.add(item).on_hover_text(&file.path).clicked() {
                                     picked_file = Some(i);
                                 }
                             });

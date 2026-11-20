@@ -11,7 +11,8 @@ pub const LANE_WIDTH: f32 = 14.0;
 const MAX_LANES_SHOWN: usize = 24;
 
 pub fn graph_width(layout: &GraphLayout) -> f32 {
-    layout.width.clamp(1, MAX_LANES_SHOWN) as f32 * LANE_WIDTH + 8.0
+    // Never narrower than the "Graph" column header.
+    (layout.width.clamp(1, MAX_LANES_SHOWN) as f32 * LANE_WIDTH + 8.0).max(44.0)
 }
 
 pub struct NodeStyle {

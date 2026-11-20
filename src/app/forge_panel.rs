@@ -113,6 +113,8 @@ fn card(ui: &mut Ui, selected: bool, add_contents: impl FnOnce(&mut Ui)) -> egui
         .fill(fill)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // Selectable text would take the click instead of the card.
+            ui.style_mut().interaction.selectable_labels = false;
             add_contents(ui);
         })
         .response

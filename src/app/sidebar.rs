@@ -60,53 +60,65 @@ impl GitloomApp {
                             ui.weak("none");
                         }
                         for (ri, r) in refs {
-                            ui.horizontal(|ui| {
-                                let is_selected = self.selected == Some(r.target);
-                                let mut text = RichText::new(&r.name);
-                                if r.is_head {
-                                    text = text.strong();
-                                    // Green reads poorly on the selection highlight.
-                                    if !is_selected {
-                                        text = text.color(Color32::from_rgb(46, 160, 67));
-                                    }
+                            let is_selected = self.selected == Some(r.target);
+                            let mut text = RichText::new(&r.name);
+                            if r.is_head {
+                                text = text.strong();
+                                // Green reads poorly on the selection highlight.
+                                if !is_selected {
+                                    text = text.color(Color32::from_rgb(46, 160, 67));
                                 }
-                                let response = ui.selectable_label(is_selected, text);
-                                let response = if r.is_head {
-                                    response.on_hover_text("Checked out")
-                                } else if r.kind == RefKind::LocalBranch {
-                                    response.on_hover_text("Double-click to switch")
-                                } else {
-                                    response
-                                };
-                                if let Some((ahead, behind)) =
-                                    r.ahead_behind.filter(|&(a, b)| a + b > 0)
-                                {
-                                    ui.weak(format!("↑{ahead} ↓{behind}"))
-                                        .on_hover_text(format!(
-                                            "vs {}",
-                                            r.upstream.as_deref().unwrap_or("upstream")
-                                        ));
-                                }
-                                if let Some(pr) =
-                                    self.pr_for_ref.get(&ri).and_then(|&pi| pulls.get(pi))
-                                    && Chip::for_pr(pr).show(ui).on_hover_text(&pr.title).clicked()
-                                {
-                                    actions.push(Action::SelectPr(pr.number));
-                                }
+                            }
+                            let pr = self.pr_for_ref.get(&ri).and_then(|&pi| pulls.get(pi));
+                            // Badges stay on the right; long branch names get truncated.
+                            let (response, pr_clicked) =
+                                egui::Sides::new().shrink_left().truncate().show(
+                                    ui,
+                                    |ui| ui.selectable_label(is_selected, text),
+                                    |ui| {
+                                        let clicked = pr.is_some_and(|pr| {
+                                            Chip::for_pr(pr)
+                                                .show_clickable(ui)
+                                                .on_hover_text(&pr.title)
+                                                .clicked()
+                                        });
+                                        if let Some((ahead, behind)) =
+                                            r.ahead_behind.filter(|&(a, b)| a + b > 0)
+                                        {
+                                            ui.weak(format!("↑{ahead} ↓{behind}")).on_hover_text(
+                                                format!(
+                                                    "vs {}",
+                                                    r.upstream.as_deref().unwrap_or("upstream")
+                                                ),
+                                            );
+                                        }
+                                        clicked
+                                    },
+                                );
+                            let response = if r.is_head {
+                                response.on_hover_text(format!("{} (checked out)", r.name))
+                            } else if r.kind == RefKind::LocalBranch {
+                                response
+                                    .on_hover_text(format!("{}\nDouble-click to switch", r.name))
+                            } else {
+                                response.on_hover_text(&r.name)
+                            };
 
-                                if response.double_clicked()
-                                    && kind == RefKind::LocalBranch
-                                    && !r.is_head
-                                {
-                                    actions.push(Action::Op(GitOp::Switch(r.name.clone())));
-                                } else if response.clicked() {
-                                    actions.push(Action::SelectCommit {
-                                        id: r.target,
-                                        center: true,
-                                    });
-                                }
-                                response.context_menu(|ui| ref_menu(ui, r, &mut actions));
-                            });
+                            if let (true, Some(pr)) = (pr_clicked, pr) {
+                                actions.push(Action::SelectPr(pr.number));
+                            }
+                            if response.double_clicked()
+                                && kind == RefKind::LocalBranch
+                                && !r.is_head
+                            {
+                                actions.push(Action::Op(GitOp::Switch(r.name.clone())));
+                            } else if response.clicked() {
+                                actions.push(Action::SelectCommit {
+                                    id: r.target,
+                                    center: true,
+                                });
+                            }
+                            response.context_menu(|ui| ref_menu(ui, r, &mut actions));
                         }
                     });
                 }

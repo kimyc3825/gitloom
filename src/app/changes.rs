@@ -164,7 +164,9 @@ fn section(
                     .color(ui::status_color(file.status)),
             );
             let is_selected = selected.is_some_and(|(path, s)| *s == staged && *path == file.path);
-            let response = ui.selectable_label(is_selected, &file.path);
+            let response = ui
+                .add(egui::Button::selectable(is_selected, &file.path).truncate())
+                .on_hover_text(&file.path);
             if response.double_clicked() {
                 actions.push(toggle());
             } else if response.clicked() {
